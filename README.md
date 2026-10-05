@@ -99,7 +99,7 @@ app open**. A missed slot runs on the next sweep rather than being skipped.
 |---------|-------------|
 | `npm run dev` | Provision or reuse the Fabric backend and start local frontend/Functions code |
 | `npm run build` | Production build |
-| `npm run build:fabric` | Build for Fabric deployment (entrypoint for `rayfin up staticapp deploy`) |
+| `npm run build:fabric` | Build for Fabric deployment (entrypoint for `rayfin up staticapp deploy`). Its `prebuild:fabric` hook regenerates `.env.local` from `rayfin/.env` so the deployed bundle always carries the current `RAYFIN_PUBLIC_*` values |
 | `npm run lint` | Lint with ESLint |
 | `npm run test` | Run unit tests with Vitest |
 | `npm run rayfin:up` | Deploy app to Fabric (no local dev server) |
@@ -153,6 +153,48 @@ npm run rayfin:up
 
 Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
 redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
+
+### 5. Continuous deployment
+
+`.github/workflows/deploy-fabric.yml` builds, lints and tests on every pull
+request, then deploys to Fabric when a PR merges to `main`. Deploys run in the
+`fabric` GitHub environment, so attach required reviewers there if you want a
+manual approval gate.
+
+The workflow authenticates with `rayfin login --service-principal`, so create an
+Entra app registration, give it access to the target Fabric workspace, and
+configure:
+
+| Kind | Name | Value |
+|------|------|-------|
+| Secret | `RAYFIN_CLIENT_ID` | Service principal application (client) ID |
+| Secret | `RAYFIN_CLIENT_SECRET` | Service principal client secret |
+| Secret | `RAYFIN_TENANT_ID` | Entra tenant ID |
+| Secret | `RAYFIN_DEPLOYMENTS_JSON` | Contents of `rayfin/.deployments.json` after a successful local `rayfin up` |
+| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` | SPA app registration client ID |
+| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID` | SPA app registration tenant ID |
+| Variable | `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` | Deployed gateway HTTPS origin |
+
+`RAYFIN_DEPLOYMENTS_JSON` matters: `rayfin/.deployments.json` is gitignored, and
+without it `rayfin up` has no record of the existing AppBackend and provisions a
+new one on every run. Deploy once locally, then copy that file into the secret.
+
+`rayfin up` applies the database schema as part of the deploy. It refuses
+destructive migrations rather than dropping data, so a schema change that would
+lose data fails the job and needs a deliberate local `rayfin up db apply --force`.
+
+The Azure gateway is not deployed by this workflow; run `azd up` from `gateway/`
+when it changes.
+
+### Troubleshooting
+
+**"Fabric API access is not configured" in the deployed app.** The bundle was
+built without `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` / `RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID`.
+These are baked in at build time, so the fix is always to correct the values and
+redeploy — restarting the app changes nothing. Confirm `rayfin/.env` has both
+(locally), or that the matching repository variables are set (in CI), then run
+`npx rayfin up`. To verify a build before deploying, search `dist/assets` for the
+client ID; if it is absent, the deployed app will fail the same way.
 
 ### Hardening before production
 
