@@ -13,11 +13,14 @@ services:
       - http://localhost:5175
       # Required so the Fabric-hosted app can complete the SSO handoff.
       - https://app.fabric.microsoft.com
-      - http://localhost:5181
-      - http://127.0.0.1:5181
+      # Both deployed items: the Fabricator-managed one and the CLI-deployed one.
+      - https://epic-haven-db2e77c645-westeurope.webapp.fabricapps.net
+      - https://edgy-cedar-10e3d8e2dd-westeurope.webapp.fabricapps.net
       - http://localhost:5180
       - http://127.0.0.1:5180
-      - https://edgy-cedar-10e3d8e2dd-westeurope.webapp.fabricapps.net
+      - http://localhost:5181
+      - http://127.0.0.1:5181
+      - http://127.0.0.1:5173
   data:
     enabled: true
     dialect: mssql
