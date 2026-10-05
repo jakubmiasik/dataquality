@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import { useAuth } from '@/hooks/AuthContext';
 import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
 import {
   callReconciliationGateway,
+  getRedirectUri,
   listWorkspaceResources,
   type FabricItem,
   type SqlObject,
@@ -777,8 +778,8 @@ export function ReconciliationPage() {
             <button type="button" onClick={() => { setTab('settings'); setError(null); }} className={secondaryButton}>Open Configuration</button>
           </div>
         )}
-        {error && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 shadow-sm"><span aria-hidden="true" className="mt-0.5 font-bold">!</span><span>{error}</span></div>}
-        {notice && <div role="status" className="mb-4 flex items-start gap-2.5 rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-900 shadow-sm"><span aria-hidden="true" className="mt-0.5 font-bold">✓</span><span>{notice}</span></div>}
+        {error && <DismissibleBanner tone="error" onDismiss={() => setError(null)}>{error}</DismissibleBanner>}
+        {notice && <DismissibleBanner tone="success" onDismiss={() => setNotice(null)}>{notice}</DismissibleBanner>}
         {!data && tab !== 'settings' && <div className={`${card} px-5 py-8 text-sm text-slate-600`}>{loading ? 'Loading reconciliation data...' : 'No reconciliation data is available yet. Configure the Rayfin data service and refresh.'}</div>}
 
         {tab === 'overview' && data && <OverviewPanel
@@ -1389,6 +1390,7 @@ export function SettingsPanel({
             Each value falls back to the matching build-time variable when it is left empty, so deployments that already
             set these in <code className="rounded bg-slate-100 px-1 py-0.5 text-xs">rayfin/.env</code> keep working.
           </p>
+          <RedirectUriHint />
           <dl className="space-y-2 border-t border-slate-200/80 pt-4 text-xs">
             {settingDefinitions.map((definition) => (
               <div key={definition.key}>
@@ -1399,6 +1401,52 @@ export function SettingsPanel({
           </dl>
         </div>
       </section>
+    </div>
+  );
+}
+
+export function RedirectUriHint() {
+  const redirectUri = getRedirectUri();
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(redirectUri);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch { /* Clipboard access can be blocked; the value is selectable either way. */ }
+  }
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+      <p className="text-xs font-semibold text-slate-700">Redirect URI for the Entra app registration</p>
+      <p className="mt-1 text-xs text-slate-500">
+        Add this exact value to the app registration above as a <strong>Single-page application</strong> redirect URI.
+        It changes with the origin the app is served from, so the deployed app and local dev each need their own entry.
+        Without it, sign-in fails with <code className="rounded bg-white px-1 py-0.5 ring-1 ring-slate-200">AADSTS50011</code>.
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <code className="min-w-0 flex-1 break-all rounded bg-white px-2 py-1 text-[11px] text-slate-700 ring-1 ring-slate-200">{redirectUri}</code>
+        <button type="button" onClick={() => void copy()} className={secondaryButton}>{copied ? 'Copied' : 'Copy'}</button>
+      </div>
+    </div>
+  );
+}
+
+export function DismissibleBanner({ tone, onDismiss, children }: { tone: 'error' | 'success'; onDismiss: () => void; children: ReactNode }) {
+  const styles = tone === 'error'
+    ? { box: 'border-rose-200 bg-rose-50 text-rose-800', icon: '!', close: 'text-rose-500 hover:bg-rose-100 hover:text-rose-900 focus-visible:outline-rose-500' }
+    : { box: 'border-teal-200 bg-teal-50 text-teal-900', icon: '✓', close: 'text-teal-600 hover:bg-teal-100 hover:text-teal-900 focus-visible:outline-teal-600' };
+  return (
+    <div role={tone === 'error' ? 'alert' : 'status'} className={`mb-4 flex items-start gap-2.5 rounded-xl border px-4 py-3 text-sm shadow-sm ${styles.box}`}>
+      <span aria-hidden="true" className="mt-0.5 font-bold">{styles.icon}</span>
+      <span className="flex-1">{children}</span>
+      <button type="button" onClick={onDismiss} aria-label="Dismiss message"
+        className={`-mr-1.5 -mt-0.5 shrink-0 rounded-lg p-1 transition focus-visible:outline-2 focus-visible:outline-offset-2 ${styles.close}`}>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="h-4 w-4" aria-hidden="true">
+          <path d="M5.5 5.5l9 9M14.5 5.5l-9 9" />
+        </svg>
+      </button>
     </div>
   );
 }

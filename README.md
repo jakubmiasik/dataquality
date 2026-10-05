@@ -194,6 +194,8 @@ npm run rayfin:up
 
 Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
 redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
+The **Configuration** tab prints the exact redirect URI for the origin you are
+currently on, with a copy button, so you can paste it straight into Entra.
 
 ### 5. Continuous integration
 
@@ -222,6 +224,16 @@ curl -i -X POST -H 'content-type: application/json' -d '{}' \
   https://<function-app>.azurewebsites.net/api/reconciliation/execute
 # HTTP/1.1 401 … {"error":"A signed-in Fabric user is required."}
 ```
+
+**Sign-in fails with `AADSTS50011` (redirect URI mismatch).** The app always
+requests `<current origin>/auth-redirect.html`, and that exact value has to be
+registered on the Entra app as a **Single-page application** redirect URI. Each
+origin needs its own entry, so a Fabric deployment does not inherit the local
+`http://localhost:5173/auth-redirect.html` one. Open the **Configuration** tab to
+copy the URI the current origin uses, then add it under *Authentication → Single-page
+application* on the app registration. Registering it as *Web* instead of *SPA*
+produces the same error, because browser-based auth-code flows require the SPA
+platform.
 
 **Browser calls to the gateway fail CORS preflight.** The app's origin is not in
 the Function App's allowed origins. Re-run `azd env set CORS_ALLOWED_ORIGINS …`
