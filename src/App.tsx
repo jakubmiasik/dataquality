@@ -15,8 +15,11 @@ function AuthGuard({
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-gray-500">Loading...</div>
+      <div className="app-canvas min-h-screen flex items-center justify-center">
+        <div className="flex items-center gap-3 text-slate-500">
+          <span aria-hidden="true" className="h-5 w-5 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
+          <span className="text-sm">Loading...</span>
+        </div>
       </div>
     );
   }
