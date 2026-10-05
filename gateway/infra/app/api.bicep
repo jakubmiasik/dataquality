@@ -23,7 +23,7 @@ param enableFile bool = false
 @allowed(['SystemAssigned', 'UserAssigned'])
 param identityType string = 'UserAssigned'
 
-@description('Origins allowed to call the gateway from a browser. The Fabric-hosted app is cross-origin, so its origin must be listed here.')
+@description('Origins allowed to call the gateway from a browser. This must be the origin serving the app itself, which for a Fabric-hosted app is its iframe origin rather than the Fabric portal.')
 param corsAllowedOrigins array = []
 
 var applicationInsightsIdentity = 'ClientId=${identityClientId};Authorization=AAD'

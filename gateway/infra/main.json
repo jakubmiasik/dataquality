@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "13469854992754379545"
+      "templateHash": "8456087111796131318"
     }
   },
   "parameters": {
@@ -107,7 +107,7 @@
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "Comma-separated browser origins allowed to call the gateway. The Fabric-hosted app runs cross-origin, so set this to the app origin (for example https://app.fabric.microsoft.com) before deploying."
+        "description": "Comma-separated browser origins allowed to call the gateway. Use the origin the app is actually served from — a Fabric-hosted app runs in an iframe with its own origin (https://<app>.webapp.fabricapps.net), not https://app.fabric.microsoft.com."
       }
     }
   },
@@ -1329,7 +1329,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "16846623835853513574"
+              "templateHash": "16529726722505226043"
             }
           },
           "parameters": {
@@ -1422,7 +1422,7 @@
               "type": "array",
               "defaultValue": [],
               "metadata": {
-                "description": "Origins allowed to call the gateway from a browser. The Fabric-hosted app is cross-origin, so its origin must be listed here."
+                "description": "Origins allowed to call the gateway from a browser. This must be the origin serving the app itself, which for a Fabric-hosted app is its iframe origin rather than the Fabric portal."
               }
             }
           },
