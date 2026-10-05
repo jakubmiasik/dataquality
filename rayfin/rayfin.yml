@@ -13,6 +13,11 @@ services:
       - http://localhost:5175
       # Required so the Fabric-hosted app can complete the SSO handoff.
       - https://app.fabric.microsoft.com
+      - http://localhost:5181
+      - http://127.0.0.1:5181
+      - http://localhost:5180
+      - http://127.0.0.1:5180
+      - https://edgy-cedar-10e3d8e2dd-westeurope.webapp.fabricapps.net
   data:
     enabled: true
     dialect: mssql
@@ -21,3 +26,8 @@ services:
     folder: dist
     buildCommand: npm run build:fabric
     indexDocument: index.html
+    assetAccess: protected
+  storage:
+    enabled: false
+  functions:
+    enabled: false
