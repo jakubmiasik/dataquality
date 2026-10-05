@@ -42,6 +42,14 @@ describe('reconciliation engine', () => {
     expect(() => buildSelectSql({ dataset: 'dbo.Users; DROP TABLE X', selections: [{ alias: 'k', kind: 'field', value: 'id' }] })).toThrow();
   });
 
+  it('drops the TOP clause when a rule asks for every row', () => {
+    const selections = [{ alias: 'recon_key', kind: 'field' as const, value: 'Account' }];
+    expect(buildSelectSql({ dataset: 'dbo.Postings', rowLimit: 0, selections }))
+      .toBe('SELECT [Account] AS [recon_key] FROM [dbo].[Postings]');
+    expect(buildSelectSql({ dataset: 'dbo.Postings', rowLimit: 250, selections }))
+      .toBe('SELECT TOP (250) [Account] AS [recon_key] FROM [dbo].[Postings]');
+  });
+
   it('allows scalar SQL logic while refusing statements and comments', () => {
     expect(validateSqlExpression("CASE WHEN Status = 1 THEN 'Posted' ELSE 'Draft' END")).toBeNull();
     expect(validateSqlExpression('CAST(Amount AS decimal(18,2))')).toBeNull();

@@ -1,4 +1,4 @@
-import { compareFindings, metricDelta, validateCompareFields, MAX_ROW_LIMIT, type CompareField, type ReconciliationFinding, type ReconciliationRule, type ReconciliationResult } from './reconciliationEngine';
+import { compareFindings, metricDelta, validateCompareFields, MAX_ROW_LIMIT, UNLIMITED_ROW_LIMIT, type CompareField, type ReconciliationFinding, type ReconciliationRule, type ReconciliationResult } from './reconciliationEngine';
 import { getRayfinClient } from './rayfinClient';
 import { nextOccurrence, validateSchedule, type ScheduleDefinition } from './reconciliationSchedule';
 import type { FabricItem } from './fabricWorkspaces';
@@ -96,6 +96,40 @@ async function fetchAll<T>(build: () => PagedQuery<T>): Promise<T[]> {
     if (!page.hasNextPage || !page.endCursor) return all;
     cursor = page.endCursor;
   }
+}
+
+/**
+ * `findById` asks DAB for the primary key alone, so every other column comes back
+ * undefined. Any read that inspects more than the id must name its columns.
+ */
+async function fetchOne<T>(build: () => PagedQuery<T>): Promise<T | null> {
+  const [record] = await fetchAll(build);
+  return record ?? null;
+}
+
+/** Every rule column, for reads whose result is snapshotted into a version row. */
+const ruleColumns = [
+  'id', 'name', 'description', 'businessArea', 'owner', 'priority', 'status', 'version',
+  'sourceAId', 'sourceBId', 'datasetA', 'datasetB', 'keyFieldA', 'keyFieldB', 'ruleGroup',
+  'duplicateHandling', 'incompleteKeyHandling', 'rowLimit', 'enabled',
+  'createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'user_id',
+] as const;
+
+/** Every column `nextOccurrence` needs to recompute a schedule's next slot. */
+const scheduleColumns = [
+  'id', 'rule_id', 'ruleName', 'enabled', 'cadence', 'intervalCount', 'hourUtc', 'minuteUtc',
+  'dayOfWeek', 'nextDueAt', 'lastTriggeredAt', 'lastRunId', 'lastStatus', 'lastError', 'user_id',
+] as const;
+
+/**
+ * An omitted row limit keeps the capped default, while an explicit zero or
+ * negative value is the caller asking for every row.
+ */
+export function normalizeRowLimit(value: unknown): number {
+  if (value === undefined || value === null || value === '') return MAX_ROW_LIMIT;
+  const numeric = Math.trunc(Number(value));
+  if (!Number.isFinite(numeric) || numeric <= 0) return UNLIMITED_ROW_LIMIT;
+  return Math.min(numeric, MAX_ROW_LIMIT);
 }
 
 /**
@@ -258,7 +292,8 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
   const client = getRayfinClient();
   const now = new Date();
   const current = draft.id
-    ? await client.data.ReconciliationRule.findById(draft.id)
+    ? await fetchOne(() => client.data.ReconciliationRule.select(['id', 'status', 'version', 'user_id'])
+      .where({ id: { eq: draft.id! } }).orderBy({ id: 'asc' }).first(1))
     : null;
   if (draft.id && !current) throw new Error('Rule not found.');
   const version = current ? current.version + 1 : 1;
@@ -278,7 +313,7 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
     ruleGroup: draft.ruleGroup as never,
     duplicateHandling: draft.duplicateHandling ?? 'exception',
     incompleteKeyHandling: draft.incompleteKeyHandling ?? 'exception',
-    rowLimit: Math.min(Math.max(Math.trunc(Number(draft.rowLimit) || MAX_ROW_LIMIT), 1), MAX_ROW_LIMIT),
+    rowLimit: normalizeRowLimit(draft.rowLimit),
     updatedAt: now,
     updatedBy: actor,
     user_id: current ? current.user_id : userId,
@@ -322,7 +357,8 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
 
 export async function setRuleEnabled(rule: StoredRule, compareFields: CompareField[], enabled: boolean, userId: string, actor: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationRule.findById(rule.id);
+  const current = await fetchOne(() => client.data.ReconciliationRule.select(ruleColumns)
+    .where({ id: { eq: rule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Rule not found.');
   if (enabled) {
     if (!current.sourceAId || !current.sourceBId || !current.datasetA || !current.datasetB || !current.keyFieldA || !current.keyFieldB) {
@@ -351,7 +387,8 @@ export async function setRuleEnabled(rule: StoredRule, compareFields: CompareFie
 /** Moves a rule out of service without deleting its history. */
 export async function retireRule(rule: StoredRule, compareFields: CompareField[], userId: string, actor: string, reason?: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationRule.findById(rule.id);
+  const current = await fetchOne(() => client.data.ReconciliationRule.select(ruleColumns)
+    .where({ id: { eq: rule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Rule not found.');
   if (current.status === 'retired') throw new Error('This rule is already retired.');
   const nextVersion = current.version + 1;
@@ -532,6 +569,80 @@ export async function compareRuns(from: StoredRun, to: StoredRun, _userId?: stri
   };
 }
 
+export interface PortfolioRuleComparison {
+  ruleId: string;
+  ruleName: string;
+  result: Awaited<ReturnType<typeof compareRuns>>;
+}
+
+export interface PortfolioComparison {
+  aggregate: Awaited<ReturnType<typeof compareRuns>>;
+  perRule: PortfolioRuleComparison[];
+  rulesCompared: number;
+  rulesSkipped: number;
+}
+
+/**
+ * Diffs every rule between two moments at once. Findings are fingerprinted per
+ * rule, so runs of different rules can never be diffed directly — instead each
+ * rule is paired with its own latest completed run at or before each moment and
+ * the per-rule results are summed into one portfolio verdict.
+ */
+export async function comparePortfolio(runs: StoredRun[], earlierAt: Date, laterAt: Date, userId?: string): Promise<PortfolioComparison> {
+  const [low, high] = earlierAt.valueOf() <= laterAt.valueOf() ? [earlierAt, laterAt] : [laterAt, earlierAt];
+  const completed = runs.filter((run) => run.status === 'completed');
+  const latestAtOrBefore = (candidates: StoredRun[], moment: Date) => candidates
+    .filter((run) => run.startedAt.valueOf() <= moment.valueOf())
+    .sort((first, second) => second.startedAt.valueOf() - first.startedAt.valueOf())[0];
+
+  const pairs = [...new Set(completed.map((run) => run.rule_id))].flatMap((ruleId) => {
+    const forRule = completed.filter((run) => run.rule_id === ruleId);
+    const from = latestAtOrBefore(forRule, low);
+    const to = latestAtOrBefore(forRule, high);
+    // A rule with no run before the earlier moment, or the same run on both
+    // sides, has nothing to say about the period and is reported as skipped.
+    if (!from || !to || from.id === to.id) return [];
+    return [{ ruleId, from, to }];
+  });
+
+  const perRule = await Promise.all(pairs.map(async (pair) => ({
+    ruleId: pair.ruleId,
+    ruleName: pair.to.ruleName,
+    result: await compareRuns(pair.from, pair.to, userId),
+  })));
+
+  const newlyFailing = perRule.flatMap((entry) => entry.result.newlyFailing);
+  const fixed = perRule.flatMap((entry) => entry.result.fixed);
+  const stillFailing = perRule.flatMap((entry) => entry.result.stillFailing);
+  const changed = perRule.flatMap((entry) => entry.result.changed);
+  const metricKeys = ['recordsA', 'recordsB', 'keysCompared', 'matched', 'exceptionCount'] as const;
+  const metrics = Object.fromEntries(metricKeys.map((key) => [key, metricDelta(
+    perRule.reduce((total, entry) => total + entry.result.metrics[key].from, 0),
+    perRule.reduce((total, entry) => total + entry.result.metrics[key].to, 0),
+  )])) as Awaited<ReturnType<typeof compareRuns>>['metrics'];
+
+  const beforeCount = fixed.length + stillFailing.length;
+  const verdict = !beforeCount && !newlyFailing.length && !stillFailing.length ? 'clean' as const
+    : newlyFailing.length && fixed.length ? 'churn' as const
+      : newlyFailing.length ? 'worse' as const
+        : fixed.length ? 'better' as const
+          : changed.length ? 'churn' as const : 'unchanged' as const;
+
+  const sortedFrom = perRule.map((entry) => entry.result.from).sort((first, second) => first.startedAt.valueOf() - second.startedAt.valueOf());
+  const sortedTo = perRule.map((entry) => entry.result.to).sort((first, second) => second.startedAt.valueOf() - first.startedAt.valueOf());
+  return {
+    aggregate: {
+      from: sortedFrom[0],
+      to: sortedTo[0],
+      reversed: earlierAt.valueOf() > laterAt.valueOf(),
+      newlyFailing, fixed, stillFailing, changed, verdict, metrics,
+    },
+    perRule: perRule.sort((first, second) => second.result.newlyFailing.length - first.result.newlyFailing.length),
+    rulesCompared: perRule.length,
+    rulesSkipped: [...new Set(completed.map((run) => run.rule_id))].length - perRule.length,
+  };
+}
+
 export async function updateExceptionStatus(exception: StoredException, status: StoredException['status'], userId: string, actor: string, reason?: string, comment?: string) {
   const allowed: Record<StoredException['status'], StoredException['status'][]> = {
     open: ['acknowledged', 'investigating', 'resolved', 'accepted'],
@@ -645,7 +756,8 @@ export async function loadRuleVersions(ruleId: string, _userId?: string) {
  */
 export async function deleteRun(runId: string): Promise<{ findingsDeleted: number; exceptionsRepointed: number }> {
   const client = getRayfinClient();
-  const run = await client.data.ReconciliationRun.findById(runId);
+  const run = await fetchOne(() => client.data.ReconciliationRun.select(['id', 'status'])
+    .where({ id: { eq: runId } }).orderBy({ id: 'asc' }).first(1));
   if (!run) throw new Error('Run not found.');
   if (run.status === 'running') throw new Error('Wait for this run to finish before deleting it.');
 
@@ -803,7 +915,8 @@ export async function deleteSchedule(scheduleId: string) {
 
 export async function setScheduleEnabled(scheduleId: string, enabled: boolean, actor: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationSchedule.findById(scheduleId);
+  const current = await fetchOne(() => client.data.ReconciliationSchedule.select(scheduleColumns)
+    .where({ id: { eq: scheduleId } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Schedule not found.');
   const now = new Date();
   await client.data.ReconciliationSchedule.update({ id: scheduleId }, {
@@ -832,7 +945,8 @@ export async function loadDueSchedules(now: Date): Promise<StoredSchedule[]> {
  */
 export async function claimSchedule(schedule: StoredSchedule, now: Date): Promise<boolean> {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationSchedule.findById(schedule.id);
+  const current = await fetchOne(() => client.data.ReconciliationSchedule.select(scheduleColumns)
+    .where({ id: { eq: schedule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current || !current.enabled) return false;
   if (new Date(current.nextDueAt).getTime() !== new Date(schedule.nextDueAt).getTime()) return false;
   await client.data.ReconciliationSchedule.update({ id: schedule.id }, {

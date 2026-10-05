@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import { useAuth } from '@/hooks/AuthContext';
 import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
@@ -27,6 +27,8 @@ import {
   loadReconciliationData,
   loadRuleFields,
   loadRuleVersions,
+  comparePortfolio,
+  normalizeRowLimit,
   purgeOrphans,
   retireRule,
   saveReconciliationSource,
@@ -36,6 +38,7 @@ import {
   setScheduleEnabled,
   updateExceptionStatus,
   type RuleDraft,
+  type PortfolioComparison,
   type StoredException,
   type StoredRule,
   type StoredRun,
@@ -67,6 +70,8 @@ interface CatalogResponse {
 }
 
 const defaultTabCaption = 'Read-only SQL checks across accessible Fabric sources.';
+/** Sentinel rule selection that compares every rule between two moments at once. */
+const ALL_RULES = '__all__';
 const tabs: Array<{ id: Tab; label: string; caption?: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'sources', label: 'Sources' },
@@ -174,6 +179,8 @@ export function ReconciliationPage() {
   const [exceptionEvents, setExceptionEvents] = useState<Array<Record<string, unknown>>>([]);
   const [versionHistory, setVersionHistory] = useState<Array<Record<string, unknown>> | null>(null);
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
+  const [portfolio, setPortfolio] = useState<PortfolioComparison | null>(null);
+  const [overviewRunId, setOverviewRunId] = useState('');
   const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft | null>(null);
   const [orphanReport, setOrphanReport] = useState<OrphanReport | null>(null);
   const [selectedRuleIds, setSelectedRuleIds] = useState<string[]>([]);
@@ -271,8 +278,18 @@ export function ReconciliationPage() {
   }), [exceptions, exceptionFilter, rules]);
 
   const selectedComparisonRuns = useMemo(() => runs.filter((run) =>
-    run.rule_id === comparisonRuleId && run.status === 'completed'
+    run.status === 'completed' && (comparisonRuleId === ALL_RULES || run.rule_id === comparisonRuleId)
   ), [runs, comparisonRuleId]);
+
+  // Both selectors open on the newest run; falling back rather than seeding state
+  // keeps the default correct when a refresh records a newer run.
+  const overviewRun = useMemo(() => runs.find((run) => run.id === overviewRunId) ?? runs[0] ?? null, [runs, overviewRunId]);
+  const exceptionRunDefaulted = useRef(false);
+  useEffect(() => {
+    if (exceptionRunDefaulted.current || !runs.length) return;
+    exceptionRunDefaulted.current = true;
+    setExceptionFilter((current) => current.runId ? current : { ...current, runId: runs[0].id });
+  }, [runs]);
 
   async function refreshData() {
     if (!user) return;
@@ -472,7 +489,7 @@ export function ReconciliationPage() {
           a: { workspaceId: sourceA.workspaceId, itemId: sourceA.itemId, itemType: sourceA.itemType },
           b: { workspaceId: sourceB.workspaceId, itemId: sourceB.itemId, itemType: sourceB.itemType },
         },
-        rule: { ...rule, compareFields, rowLimit: Math.min(rule.rowLimit || 10000, 10000) },
+        rule: { ...rule, compareFields, rowLimit: normalizeRowLimit(rule.rowLimit) },
       });
       await completeRun(run.id, rule, execution.result, user.id);
       return { ok: true, runId: run.id, matched: execution.result.summary.matched, findings: execution.result.summary.exceptions };
@@ -552,7 +569,18 @@ export function ReconciliationPage() {
     if (!from || !to) { setError('Choose two completed runs to compare.'); return; }
     setBusyKey('compare');
     setError(null);
-    try { setComparison(await compareStoredRuns(from, to, user.id)); }
+    try {
+      if (comparisonRuleId === ALL_RULES) {
+        // The two picks act as moments in time, not as a directly diffable pair.
+        const result = await comparePortfolio(runs, from.startedAt, to.startedAt, user.id);
+        if (!result.rulesCompared) throw new Error('No rule has a completed run on both sides of the selected period.');
+        setPortfolio(result);
+        setComparison(result.aggregate);
+      } else {
+        setPortfolio(null);
+        setComparison(await compareStoredRuns(from, to, user.id));
+      }
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to compare these runs.'); }
     finally { setBusyKey(''); }
   }
@@ -784,6 +812,8 @@ export function ReconciliationPage() {
 
         {tab === 'overview' && data && <OverviewPanel
           rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
+          selectedRun={overviewRun} onSelectRun={setOverviewRunId}
+          onEditRule={(rule) => { setTab('rules'); void openEditRule(rule); }}
           onNavigate={setTab} onFindOrphans={() => void checkOrphans()} onPurgeOrphans={() => void purgeOrphanRows()}
         />}
         {tab === 'sources' && <SourcesPanel
@@ -825,7 +855,9 @@ export function ReconciliationPage() {
         }} />}
         {tab === 'compare' && data && <ComparePanel
           rules={rules} runs={selectedComparisonRuns} ruleId={comparisonRuleId} fromRunId={fromRunId} toRunId={toRunId}
-          result={comparison} busy={busyKey === 'compare'} onRule={setComparisonRuleId} onFrom={setFromRunId} onTo={setToRunId}
+          result={comparison} portfolio={portfolio} busy={busyKey === 'compare'}
+          onRule={(id) => { setComparisonRuleId(id); setFromRunId(''); setToRunId(''); setComparison(null); setPortfolio(null); }}
+          onFrom={setFromRunId} onTo={setToRunId}
           onCompare={() => void compareSelectedRuns()}
         />}
         {tab === 'settings' && <SettingsPanel
@@ -848,24 +880,30 @@ export function ReconciliationPage() {
 }
 
 function OverviewPanel({
-  rules, runs, openExceptions, orphanReport, busyKey, onNavigate, onFindOrphans, onPurgeOrphans,
+  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, onSelectRun, onEditRule, onNavigate, onFindOrphans, onPurgeOrphans,
 }: {
   rules: StoredRule[];
   runs: StoredRun[];
   openExceptions: StoredException[];
   orphanReport: OrphanReport | null;
   busyKey: string;
+  selectedRun: StoredRun | null;
+  onSelectRun: (id: string) => void;
+  onEditRule: (rule: StoredRule) => void;
   onNavigate: (tab: Tab) => void;
   onFindOrphans: () => void;
   onPurgeOrphans: () => void;
 }) {
   const recentRuns = runs.slice(0, 8);
-  const groupCounts = ruleGroups.map(([key, label]) => ({
-    key, label,
-    total: rules.filter((rule) => rule.ruleGroup === key).length,
-    active: rules.filter((rule) => rule.ruleGroup === key && rule.enabled).length,
-    exceptions: openExceptions.filter((exception) => rules.find((rule) => rule.id === exception.rule_id)?.ruleGroup === key).length,
-  })).filter((group) => group.total > 0);
+  const groupCounts = ruleGroups.map(([key, label]) => {
+    const members = rules.filter((rule) => rule.ruleGroup === key);
+    return {
+      key, label, members,
+      total: members.length,
+      active: members.filter((rule) => rule.enabled).length,
+      exceptions: openExceptions.filter((exception) => rules.find((rule) => rule.id === exception.rule_id)?.ruleGroup === key).length,
+    };
+  }).filter((group) => group.total > 0);
   return (
     <div className="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -875,11 +913,36 @@ function OverviewPanel({
         <Metric label="Completed runs" value={runs.filter((run) => run.status === 'completed').length} accent="teal" onClick={() => onNavigate('runs')} />
       </div>
       <section className={card}>
-        <SectionTitle title="Coverage by rule group" action={<button type="button" onClick={() => onNavigate('rules')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Manage rules</button>} />
+        <SectionTitle title="Run summary" subtitle="Showing the most recent run until you choose another." action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Run history</button>} />
+        <div className="space-y-4 p-4">
+          <div className="max-w-xl"><label className={labelClass} htmlFor="overview-run">Run</label>
+            <select id="overview-run" className={input} value={selectedRun?.id ?? ''} onChange={(event) => onSelectRun(event.target.value)} disabled={!runs.length}>
+              {runs.length ? runs.map((run) => <option key={run.id} value={run.id}>{run.ruleName} · v{run.ruleVersion} · {formatDate(run.startedAt)}</option>) : <option value="">No runs recorded</option>}
+            </select>
+          </div>
+          {selectedRun ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric label="Rows read (A)" value={selectedRun.recordsA} accent="slate" onClick={noop} />
+            <Metric label="Rows read (B)" value={selectedRun.recordsB} accent="slate" onClick={noop} />
+            <Metric label="Matched" value={selectedRun.matched} accent="teal" onClick={noop} />
+            <Metric label="Findings" value={selectedRun.exceptionCount} accent="rose" onClick={noop} />
+          </div> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
+          {selectedRun && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Status <StatusPill value={selectedRun.status} /> <span>started {formatDate(selectedRun.startedAt)} · completed {formatDate(selectedRun.completedAt)}{selectedRun.errorMessage ? ` · ${selectedRun.errorMessage}` : ''}</span></p>}
+        </div>
+      </section>
+      <section className={card}>
+        <SectionTitle title="Coverage by rule group" subtitle="Select a rule to open its definition." action={<button type="button" onClick={() => onNavigate('rules')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Manage rules</button>} />
         {groupCounts.length ? <div className="grid divide-y divide-slate-100 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-3">
-          {groupCounts.map((group) => <div key={group.key} className="flex items-center justify-between gap-4 px-4 py-3">
-            <div><p className="text-sm font-medium">{group.label}</p><p className="mt-0.5 text-xs text-slate-500">{group.total} rule{group.total === 1 ? '' : 's'}</p></div>
-            <div className="flex gap-5 text-right text-xs"><div><p className="font-semibold text-teal-800">{group.active}</p><p className="text-slate-500">enabled</p></div><div><p className="font-semibold text-rose-700">{group.exceptions}</p><p className="text-slate-500">open</p></div></div>
+          {groupCounts.map((group) => <div key={group.key} className="px-4 py-3">
+            <div className="flex items-start justify-between gap-4">
+              <p className="text-sm font-medium">{group.label}</p>
+              <div className="flex shrink-0 gap-5 text-right text-xs"><div><p className="font-semibold text-teal-800">{group.active}</p><p className="text-slate-500">enabled</p></div><div><p className="font-semibold text-rose-700">{group.exceptions}</p><p className="text-slate-500">open</p></div></div>
+            </div>
+            <ul className="mt-2 space-y-1">
+              {group.members.map((rule) => <li key={rule.id} className="flex items-center justify-between gap-2">
+                <button type="button" onClick={() => onEditRule(rule)} disabled={busyKey === `rule:${rule.id}`} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline disabled:opacity-50">{busyKey === `rule:${rule.id}` ? 'Opening...' : rule.name}</button>
+                <span className={`shrink-0 text-[11px] ${rule.enabled ? 'text-teal-700' : 'text-slate-400'}`}>{rule.enabled ? 'enabled' : rule.status}</span>
+              </li>)}
+            </ul>
           </div>)}
         </div> : <EmptyMessage>Rule coverage will appear here after you create rules.</EmptyMessage>}
       </section>
@@ -1030,7 +1093,7 @@ function RulesPanel({
   </div>;
 }
 
-function RuleEditor({
+export function RuleEditor({
   draft, sources, objectsForSource, busy, onDraft, onSelectSource, onUpdateField, onAddField, onRemoveField, onSave, onCancel, onRegisterSource,
 }: {
   draft: RuleDraft;
@@ -1050,8 +1113,14 @@ function RuleEditor({
   const objectsB = objectsForSource(draft.sourceBId);
   const selectedA = objectsA.find((object) => objectName(object) === draft.datasetA);
   const selectedB = objectsB.find((object) => objectName(object) === draft.datasetB);
-  return <section className={card}>
-    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h3 className="font-semibold">{draft.id ? 'Edit reconciliation rule' : 'New reconciliation rule'}</h3><p className="mt-1 text-sm text-slate-500">Both sides use their own source, dataset, key, and projection.</p></div><button type="button" onClick={onCancel} className="text-sm text-slate-600 hover:underline">Close</button></div>
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onCancel(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+  return <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/40 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+    <section role="dialog" aria-modal="true" aria-labelledby="rule-editor-heading" className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-2xl">
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h3 id="rule-editor-heading" className="font-semibold">{draft.id ? 'Edit reconciliation rule' : 'New reconciliation rule'}</h3><p className="mt-1 text-sm text-slate-500">Both sides use their own source, dataset, key, and projection.</p></div><button type="button" onClick={onCancel} className="text-sm text-slate-600 hover:underline">Close</button></div>
     <div className="space-y-5 p-4">
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <div><label className={labelClass}>Rule name</label><input className={input} value={draft.name} onChange={(event) => onDraft('name', event.target.value)} /></div>
@@ -1068,12 +1137,13 @@ function RuleEditor({
         <div><label className={labelClass}>Priority</label><select className={input} value={draft.priority} onChange={(event) => onDraft('priority', event.target.value as RuleDraft['priority'])}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
         <div><label className={labelClass}>Duplicate key handling</label><select className={input} value={draft.duplicateHandling} onChange={(event) => onDraft('duplicateHandling', event.target.value as RuleDraft['duplicateHandling'])}><option value="exception">Raise finding</option><option value="first">Compare first record</option><option value="ignore">Ignore duplicate key</option></select></div>
         <div><label className={labelClass}>Missing key handling</label><select className={input} value={draft.incompleteKeyHandling} onChange={(event) => onDraft('incompleteKeyHandling', event.target.value as RuleDraft['incompleteKeyHandling'])}><option value="exception">Raise finding</option><option value="ignore">Ignore missing key</option></select></div>
-        <div><label className={labelClass}>Maximum rows per side</label><input className={input} type="number" min={1} max={10000} value={draft.rowLimit} onChange={(event) => onDraft('rowLimit', Number(event.target.value))} /></div>
+        <div><label className={labelClass}>Rows per side</label><select className={input} value={draft.rowLimit === 0 ? 'all' : 'capped'} onChange={(event) => onDraft('rowLimit', event.target.value === 'all' ? 0 : 10000)}><option value="capped">Limit rows read</option><option value="all">All rows (no limit)</option></select></div>
+        {draft.rowLimit !== 0 && <div><label className={labelClass}>Maximum rows per side</label><input className={input} type="number" min={1} max={10000} value={draft.rowLimit} onChange={(event) => onDraft('rowLimit', Number(event.target.value))} /></div>}
       </div>
       <div className="border-t border-slate-200 pt-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-semibold">Values to compare</h4><p className="mt-1 text-xs text-slate-500">Operands may be columns, SQL expressions, fixed values, or aggregates.</p></div><button type="button" onClick={onAddField} className={secondaryButton}>Add value</button></div>
         <div className="space-y-3">
-          {draft.compareFields.map((field, index) => <div key={`${index}-${field.label}`} className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
+          {draft.compareFields.map((field, index) => <div key={index} className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
             <div className="mb-3 grid gap-3 md:grid-cols-[minmax(130px,1fr)_150px_150px_120px_auto]">
               <div><label className={labelClass}>Label</label><input className={input} value={field.label} onChange={(event) => onUpdateField(index, (current) => ({ ...current, label: event.target.value }))} /></div>
               <div><label className={labelClass}>Value type</label><select className={input} value={field.type} onChange={(event) => onUpdateField(index, (current) => ({ ...current, type: event.target.value as CompareField['type'] }))}><option value="string">Text</option><option value="number">Number</option><option value="date">Date</option><option value="boolean">Boolean</option></select></div>
@@ -1094,7 +1164,8 @@ function RuleEditor({
       </div>
       <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 pt-4"><button type="button" onClick={onCancel} className={secondaryButton}>Cancel</button><button type="button" onClick={onSave} disabled={busy} className={primaryButton}>{busy ? 'Saving...' : 'Save draft'}</button></div>
     </div>
-  </section>;
+  </section>
+  </div>;
 }
 
 function SourceRuleSide({ side, draft, sources, objects, selectedObject, onSelectSource, onDraft, onRegister }: {
@@ -1220,7 +1291,7 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   };
   return <div className="grid gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.8fr)]">
     <section className={card}>
-      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{runIds.map((runId) => <option key={runId} value={runId}>{runs.find((run) => run.id === runId)?.ruleName ?? 'Run'} · {runId.slice(0, 8)}</option>)}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
+      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{runIds.map((runId) => { const run = runs.find((candidate) => candidate.id === runId); return <option key={runId} value={runId}>{run ? `${run.ruleName} · ${formatDate(run.startedAt)}` : `Deleted run · ${runId.slice(0, 8)}`}</option>; })}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500"><span>{exceptions.length} of {allExceptions.length} exceptions · {selectedIds.length} selected</span><div className="flex flex-wrap gap-2"><select className={input} value="" aria-label="Bulk status" onChange={(event) => { if (event.target.value) onBulkStatus(event.target.value as StoredException['status']); }} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'}><option value="">Bulk status...</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select><button type="button" onClick={onBulkAssign} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Assign selected</button><button type="button" onClick={onBulkComment} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Comment selected</button></div></div>
       {exceptions.length ? <div className="max-h-[680px] overflow-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="sticky top-0 bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5"><input type="checkbox" aria-label="Select visible exceptions" checked={visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id))} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...visibleIds])] : selectedIds.filter((id) => !visibleIds.includes(id)))} /></th><th className="px-4 py-2.5">Business key</th><th className="px-4 py-2.5">Outcome</th><th className="px-4 py-2.5">Severity</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5">Last seen</th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{exceptions.map((exception) => <tr key={exception.id} className={selected?.id === exception.id ? 'bg-teal-50' : 'hover:bg-slate-50'}><td className="px-4 py-2.5"><input type="checkbox" aria-label={`Select exception ${exception.businessKey}`} checked={selectedIds.includes(exception.id)} onChange={(event) => toggleSelection(exception.id, event.target.checked)} /></td><td className="px-4 py-2.5"><button type="button" onClick={() => onSelect(exception)} className="text-left font-semibold text-teal-900 hover:underline">{exception.businessKey}</button></td><td className="px-4 py-2.5 text-slate-600">{humanOutcome(exception.outcome)}</td><td className="px-4 py-2.5"><SeverityPill value={exception.severity} /></td><td className="px-4 py-2.5"><StatusPill value={exception.status} /></td><td className="px-4 py-2.5 text-slate-600">{exception.owner || 'Unassigned'}</td><td className="px-4 py-2.5 text-xs text-slate-500">{formatDate(exception.lastSeen)}</td></tr>)}</tbody></table></div> : <EmptyMessage>No exceptions match this filter.</EmptyMessage>}
     </section>
@@ -1256,29 +1327,40 @@ function ExceptionValues({ exception }: { exception: StoredException }) {
   </div>;
 }
 
-function ComparePanel({ rules, runs, ruleId, fromRunId, toRunId, result, busy, onRule, onFrom, onTo, onCompare }: {
+function ComparePanel({ rules, runs, ruleId, fromRunId, toRunId, result, portfolio, busy, onRule, onFrom, onTo, onCompare }: {
   rules: StoredRule[];
   runs: StoredRun[];
   ruleId: string;
   fromRunId: string;
   toRunId: string;
   result: ComparisonResult | null;
+  portfolio: PortfolioComparison | null;
   busy: boolean;
   onRule: (id: string) => void;
   onFrom: (id: string) => void;
   onTo: (id: string) => void;
   onCompare: () => void;
 }) {
+  const everyRule = ruleId === ALL_RULES;
+  const runLabel = (run: StoredRun) => `${formatDate(run.startedAt)}${everyRule ? ` · ${run.ruleName}` : ` · v${run.ruleVersion}`} · ${run.exceptionCount} findings`;
   return <div className="space-y-5">
     <section className={card}><div className="grid gap-3 p-4 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
-      <div><label className={labelClass}>Rule</label><select className={input} value={ruleId} onChange={(event) => onRule(event.target.value)}><option value="">Choose a rule</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div>
-      <div><label className={labelClass}>Earlier run</label><select className={input} value={fromRunId} onChange={(event) => onFrom(event.target.value)}><option value="">Choose a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{formatDate(run.startedAt)} · v{run.ruleVersion} · {run.exceptionCount} findings</option>)}</select></div>
-      <div><label className={labelClass}>Later run</label><select className={input} value={toRunId} onChange={(event) => onTo(event.target.value)}><option value="">Choose a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{formatDate(run.startedAt)} · v{run.ruleVersion} · {run.exceptionCount} findings</option>)}</select></div>
+      <div><label className={labelClass}>Rule</label><select className={input} value={ruleId} onChange={(event) => onRule(event.target.value)}><option value="">Choose a rule</option><option value={ALL_RULES}>All rules (portfolio)</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div>
+      <div><label className={labelClass}>{everyRule ? 'Earlier point in time' : 'Earlier run'}</label><select className={input} value={fromRunId} onChange={(event) => onFrom(event.target.value)}><option value="">Choose a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{runLabel(run)}</option>)}</select></div>
+      <div><label className={labelClass}>{everyRule ? 'Later point in time' : 'Later run'}</label><select className={input} value={toRunId} onChange={(event) => onTo(event.target.value)}><option value="">Choose a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{runLabel(run)}</option>)}</select></div>
       <button type="button" onClick={onCompare} disabled={busy || !fromRunId || !toRunId} className={primaryButton}>{busy ? 'Comparing...' : 'Compare'}</button>
-    </div><div className="border-t border-slate-100 px-4 py-3 text-xs text-slate-500">Runs from different rules cannot be compared. Findings are matched by stable business-key fingerprints.</div></section>
+    </div><div className="border-t border-slate-100 px-4 py-3 text-xs text-slate-500">{everyRule
+      ? 'Each selection marks a moment in time. Every rule is paired with its own latest completed run at or before that moment, and the per-rule results are summed below.'
+      : 'Runs from different rules cannot be compared. Findings are matched by stable business-key fingerprints.'}</div></section>
+    {portfolio && <section className={card}>
+      <SectionTitle title="Per-rule breakdown" subtitle={`${portfolio.rulesCompared} rule${portfolio.rulesCompared === 1 ? '' : 's'} compared${portfolio.rulesSkipped ? ` · ${portfolio.rulesSkipped} skipped for lack of runs on both sides` : ''}`} />
+      <div className="overflow-x-auto"><table className="w-full min-w-[720px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Verdict</th><th className="px-4 py-2.5 text-right">New</th><th className="px-4 py-2.5 text-right">Fixed</th><th className="px-4 py-2.5 text-right">Still failing</th><th className="px-4 py-2.5 text-right">Changed</th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
+        {portfolio.perRule.map((entry) => <tr key={entry.ruleId}><td className="px-4 py-3 font-medium">{entry.ruleName}<span className="ml-2 text-xs text-slate-400">v{entry.result.from.ruleVersion} → v{entry.result.to.ruleVersion}</span></td><td className="px-4 py-3"><VerdictPill verdict={entry.result.verdict} /></td><td className="px-4 py-3 text-right tabular-nums">{entry.result.newlyFailing.length}</td><td className="px-4 py-3 text-right tabular-nums">{entry.result.fixed.length}</td><td className="px-4 py-3 text-right tabular-nums">{entry.result.stillFailing.length}</td><td className="px-4 py-3 text-right tabular-nums">{entry.result.changed.length}</td></tr>)}
+      </tbody></table></div>
+    </section>}
     {result && <>
       <section className={card}>
-        <SectionTitle title="Comparison verdict" action={<VerdictPill verdict={result.verdict} />} />
+        <SectionTitle title={portfolio ? 'Portfolio verdict' : 'Comparison verdict'} action={<VerdictPill verdict={result.verdict} />} />
         <div className="space-y-3 p-4">
           {result.reversed && <p className="text-sm text-amber-800">The selected runs were reordered into chronological order.</p>}
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">{Object.entries(result.metrics).map(([key, value]) => <MetricDeltaCard key={key} label={key.replace(/([A-Z])/g, ' $1')} value={value} />)}</div>

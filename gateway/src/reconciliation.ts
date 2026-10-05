@@ -52,9 +52,10 @@ export async function validateRequest(value: unknown): Promise<{ request?: Recon
   if (!rule || !rule.datasetA?.trim() || !rule.datasetB?.trim() || !rule.keyFieldA?.trim() || !rule.keyFieldB?.trim()) {
     return { error: 'The rule must define both datasets and business keys.' };
   }
+  // 0 is the explicit "read every row" sentinel; anything else stays within the capped range.
   const rowLimit = rule.rowLimit ?? 10000;
-  if (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000) {
-    return { error: 'rowLimit must be between 1 and 10000.' };
+  if (!Number.isInteger(rowLimit) || rowLimit < 0 || rowLimit > 10000) {
+    return { error: 'rowLimit must be 0 (all rows) or between 1 and 10000.' };
   }
   const engine = await import('./reconciliationEngine.js');
   const problems = engine.validateCompareFields(rule.compareFields ?? []);
