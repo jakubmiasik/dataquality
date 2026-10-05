@@ -542,6 +542,19 @@ export async function loadRunFindings(runId: string, _userId?: string) {
   })) as unknown as ReconciliationFinding[];
 }
 
+/**
+ * Exceptions are long-lived and their `lastRunId` is overwritten every time a
+ * later run observes them again, so it cannot answer "what did this run find?".
+ * Findings are written once per run and never rewritten, which makes them the
+ * durable membership record for a run.
+ */
+export async function loadRunExceptionIds(runId: string) {
+  const client = getRayfinClient();
+  const rows = await fetchAll(() => client.data.ReconciliationFinding.select(['id', 'run_id', 'exception_id'])
+    .where({ run_id: { eq: runId } }).orderBy({ id: 'asc' }).first(pageSize));
+  return [...new Set(rows.map((row) => String(row.exception_id)).filter(Boolean))];
+}
+
 export async function compareRuns(from: StoredRun, to: StoredRun, _userId?: string) {
   if (from.rule_id !== to.rule_id) throw new Error('Only runs of the same rule can be compared.');
   // Always report oldest-to-newest so the deltas read in chronological order.

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { getRayfinClient } = vi.hoisted(() => ({ getRayfinClient: vi.fn() }));
 vi.mock('@/services/rayfinClient', () => ({ getRayfinClient }));
 
-import { claimSchedule, comparePortfolio, normalizeRowLimit, setRuleEnabled, type StoredRule, type StoredRun, type StoredSchedule } from '@/services/reconciliationRepository';
+import { claimSchedule, comparePortfolio, loadRunExceptionIds, normalizeRowLimit, setRuleEnabled, type StoredRule, type StoredRun, type StoredSchedule } from '@/services/reconciliationRepository';
 import type { CompareField } from '@/services/reconciliationEngine';
 
 type Row = Record<string, unknown>;
@@ -128,6 +128,28 @@ describe('setRuleEnabled', () => {
 
     const snapshot = JSON.parse(writes.ReconciliationRuleVersion[0].snapshot as string) as Row;
     expect(snapshot).toMatchObject({ datasetA: 'dbo.Ledger', keyFieldA: 'Id', version: 4 });
+  });
+});
+
+describe('loadRunExceptionIds', () => {
+  const findings: Row[] = [
+    { id: 'f-1', run_id: 'run-1', exception_id: 'exc-1' },
+    { id: 'f-2', run_id: 'run-1', exception_id: 'exc-2' },
+    { id: 'f-3', run_id: 'run-2', exception_id: 'exc-2' },
+    { id: 'f-4', run_id: 'run-1', exception_id: 'exc-1' },
+  ];
+
+  it('returns the exceptions a run recorded, even after a later run re-observed them', async () => {
+    const { client } = fakeClient({ ReconciliationFinding: findings });
+    getRayfinClient.mockReturnValue(client);
+    await expect(loadRunExceptionIds('run-1')).resolves.toEqual(['exc-1', 'exc-2']);
+    await expect(loadRunExceptionIds('run-2')).resolves.toEqual(['exc-2']);
+  });
+
+  it('returns nothing for a run with no findings', async () => {
+    const { client } = fakeClient({ ReconciliationFinding: findings });
+    getRayfinClient.mockReturnValue(client);
+    await expect(loadRunExceptionIds('run-9')).resolves.toEqual([]);
   });
 });
 
