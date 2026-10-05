@@ -2,7 +2,14 @@
 
 @custom-variant dark (&:is(.dark *));
 
-@theme inline {
+/* Plain `@theme` (not `@theme inline`): inline bakes literal colour values into
+   every utility, which makes them impossible to re-point at runtime. Emitting
+   `var(--color-*)` references is what lets the dark palette below take over. */
+@theme {
+  /* Stays light in both themes: the foreground for saturated accent fills
+     (primary/danger buttons, logo chips) where plain `white` would flip dark. */
+  --color-oncolor: oklch(0.99 0 0);
+
   --color-blue-50: oklch(0.97 0.014 254.6);
   --color-blue-100: oklch(0.932 0.032 255.6);
   --color-blue-500: oklch(0.623 0.214 259.1);
@@ -30,6 +37,114 @@
 }
 
 @layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  /* Dark theme.
+     Rather than adding `dark:` variants to ~400 colour utilities across the
+     app, the palette itself is re-pointed. Tailwind v4 compiles every colour
+     utility to `var(--color-*)`, so redefining those variables under `.dark`
+     re-themes everything at once and keeps a single source of truth.
+
+     Each accent ramp is mirrored, not shifted: the 50-200 rungs become deep
+     tints (they are only ever chip//border fills) while 700-900 become light
+     (they are only ever text drawn on those chips). The 400-600 rungs carry
+     solid buttons, so they keep roughly their original luminance. */
+  .dark {
+    color-scheme: dark;
+
+    /* Surfaces. `white` is the raised card; slate-50/100 are washes layered on
+       top of it, so they get *lighter* here rather than darker. */
+    --color-white: oklch(0.215 0.017 264);
+    --color-slate-50: oklch(0.253 0.018 264);
+    --color-slate-100: oklch(0.285 0.019 264);
+    --color-slate-200: oklch(0.33 0.02 264);
+    --color-slate-300: oklch(0.4 0.022 264);
+    --color-slate-400: oklch(0.58 0.03 258);
+    --color-slate-500: oklch(0.7 0.03 256);
+    --color-slate-600: oklch(0.78 0.025 256);
+    --color-slate-700: oklch(0.85 0.02 255);
+    --color-slate-800: oklch(0.9 0.015 255);
+    --color-slate-900: oklch(0.96 0.01 255);
+    --color-slate-950: oklch(0.98 0.005 255);
+
+    /* The base border rule falls back to this token. */
+    --color-gray-200: oklch(0.33 0.02 264);
+
+    --color-brand-50: oklch(0.26 0.055 284);
+    --color-brand-100: oklch(0.3 0.07 284);
+    --color-brand-200: oklch(0.37 0.09 284);
+    --color-brand-300: oklch(0.5 0.13 284);
+    --color-brand-400: oklch(0.63 0.17 284);
+    --color-brand-500: oklch(0.68 0.18 284);
+    --color-brand-600: oklch(0.62 0.19 283);
+    --color-brand-700: oklch(0.78 0.14 285);
+    --color-brand-800: oklch(0.86 0.1 286);
+    --color-brand-900: oklch(0.92 0.06 286);
+
+    --color-rose-50: oklch(0.26 0.055 18);
+    --color-rose-100: oklch(0.3 0.07 18);
+    --color-rose-200: oklch(0.37 0.09 18);
+    --color-rose-300: oklch(0.5 0.13 18);
+    --color-rose-400: oklch(0.63 0.17 19);
+    --color-rose-500: oklch(0.67 0.2 20);
+    /* Carries the danger button fill under light `oncolor` text; kept dark
+       enough to clear WCAG AA (measured 4.1:1 at the lighter 0.61). */
+    --color-rose-600: oklch(0.545 0.195 20);
+    --color-rose-700: oklch(0.77 0.15 19);
+    --color-rose-800: oklch(0.86 0.11 19);
+    --color-rose-900: oklch(0.92 0.07 19);
+
+    --color-red-50: oklch(0.26 0.055 22);
+    --color-red-100: oklch(0.3 0.07 22);
+    --color-red-200: oklch(0.37 0.09 22);
+    --color-red-600: oklch(0.62 0.21 24);
+    --color-red-700: oklch(0.78 0.15 23);
+    --color-red-800: oklch(0.86 0.11 23);
+
+    --color-teal-50: oklch(0.26 0.04 185);
+    --color-teal-100: oklch(0.3 0.05 185);
+    --color-teal-200: oklch(0.37 0.07 185);
+    --color-teal-300: oklch(0.5 0.09 183);
+    --color-teal-400: oklch(0.65 0.11 182);
+    --color-teal-500: oklch(0.71 0.12 182);
+    --color-teal-600: oklch(0.65 0.12 182);
+    --color-teal-700: oklch(0.79 0.11 182);
+    --color-teal-800: oklch(0.87 0.08 182);
+    --color-teal-900: oklch(0.93 0.05 182);
+
+    --color-emerald-50: oklch(0.26 0.045 163);
+    --color-emerald-100: oklch(0.3 0.055 163);
+    --color-emerald-200: oklch(0.37 0.075 163);
+    --color-emerald-500: oklch(0.72 0.14 162);
+    --color-emerald-600: oklch(0.66 0.14 162);
+    --color-emerald-700: oklch(0.8 0.12 163);
+    --color-emerald-800: oklch(0.87 0.09 163);
+    --color-emerald-900: oklch(0.93 0.055 163);
+
+    --color-amber-50: oklch(0.26 0.04 75);
+    --color-amber-100: oklch(0.3 0.05 75);
+    --color-amber-200: oklch(0.37 0.065 75);
+    --color-amber-300: oklch(0.52 0.09 75);
+    --color-amber-400: oklch(0.7 0.12 76);
+    --color-amber-500: oklch(0.79 0.14 77);
+    --color-amber-600: oklch(0.73 0.145 70);
+    --color-amber-700: oklch(0.85 0.12 78);
+    --color-amber-800: oklch(0.9 0.09 80);
+    --color-amber-900: oklch(0.94 0.055 82);
+
+    --color-blue-50: oklch(0.26 0.05 258);
+    --color-blue-100: oklch(0.3 0.065 258);
+    --color-blue-500: oklch(0.68 0.17 259);
+    --color-blue-600: oklch(0.62 0.19 261);
+    --color-blue-700: oklch(0.79 0.13 260);
+
+    /* Flat shadows vanish on dark surfaces; deepen them to keep elevation. */
+    --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.35), 0 1px 3px 0 rgb(0 0 0 / 0.3);
+    --shadow-card-hover: 0 4px 14px -2px rgb(0 0 0 / 0.5), 0 2px 6px -2px rgb(0 0 0 / 0.4);
+  }
+
   *,
   ::after,
   ::before,
@@ -64,6 +179,15 @@
       radial-gradient(60rem 30rem at 85% -10%, oklch(0.625 0.19 284 / 0.1), transparent 60%),
       radial-gradient(45rem 25rem at 0% 0%, oklch(0.7 0.13 200 / 0.09), transparent 55%);
     background-attachment: fixed;
+  }
+
+  .dark .app-canvas {
+    /* slate-50 now reads as an on-card wash, so the page needs its own value
+       to stay a step darker than the cards floating on it. */
+    background-color: oklch(0.165 0.018 264);
+    background-image:
+      radial-gradient(60rem 30rem at 85% -10%, oklch(0.625 0.19 284 / 0.22), transparent 60%),
+      radial-gradient(45rem 25rem at 0% 0%, oklch(0.7 0.13 200 / 0.16), transparent 55%);
   }
 
   .card-hover {

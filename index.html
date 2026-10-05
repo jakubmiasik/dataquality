@@ -10,6 +10,20 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
+    <script>
+      // Applied before first paint so a dark-theme reload never flashes white.
+      // Mirrors resolveTheme() in src/services/theme.ts.
+      (function () {
+        try {
+          var stored = localStorage.getItem('reconciliation.theme');
+          var dark = stored === 'dark' || (stored !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', dark);
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (error) {
+          /* no stored preference available; the app applies one after mount */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
