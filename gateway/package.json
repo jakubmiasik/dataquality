@@ -1,0 +1,24 @@
+{
+  "name": "functions-quickstart-typescript-azd",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/gateway/src/{index.js,functions/*.js}",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "clean": "rimraf dist",
+    "prestart": "npm run clean && npm run build",
+    "start": "func start",
+    "test": "npm run build && node --test dist/gateway/src/reconciliation.test.js"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.11.0",
+    "mssql": "^12.7.2"
+  },
+  "devDependencies": {
+    "@types/mssql": "^12.3.0",
+    "@types/node": "^22.x",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.0.0"
+  }
+}
