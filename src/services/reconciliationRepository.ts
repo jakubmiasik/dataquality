@@ -24,6 +24,8 @@ export type StoredRule = Omit<ReconciliationRule, 'compareFields'> & {
 
 export type StoredRun = {
   id: string;
+  /** Shared by every run started from one trigger. Absent on pre-batch rows. */
+  batch_id?: string;
   rule_id: string;
   ruleVersion: number;
   ruleName: string;
@@ -243,7 +245,7 @@ export async function loadReconciliationData(_userId?: string) {
       .orderBy({ itemName: 'asc' }).first(pageSize)),
     fetchAll(() => client.data.ReconciliationRule.select(['id', 'name', 'description', 'businessArea', 'owner', 'priority', 'status', 'version', 'sourceAId', 'sourceBId', 'datasetA', 'datasetB', 'keyFieldA', 'keyFieldB', 'ruleGroup', 'duplicateHandling', 'incompleteKeyHandling', 'rowLimit', 'enabled', 'updatedAt', 'user_id'])
       .orderBy({ updatedAt: 'desc' }).first(pageSize)),
-    fetchAll(() => client.data.ReconciliationRun.select(['id', 'rule_id', 'ruleVersion', 'ruleName', 'status', 'recordsA', 'recordsB', 'keysCompared', 'matched', 'exceptionCount', 'summaryJson', 'errorMessage', 'startedAt', 'completedAt', 'runBy', 'user_id'])
+    fetchAll(() => client.data.ReconciliationRun.select(['id', 'batch_id', 'rule_id', 'ruleVersion', 'ruleName', 'status', 'recordsA', 'recordsB', 'keysCompared', 'matched', 'exceptionCount', 'summaryJson', 'errorMessage', 'startedAt', 'completedAt', 'runBy', 'user_id'])
       .orderBy({ startedAt: 'desc' }).first(pageSize)),
     fetchAll(() => client.data.ReconciliationException.select(['id', 'rule_id', 'lastRunId', 'fingerprint', 'businessKey', 'outcome', 'severity', 'status', 'owner', 'detailJson', 'firstSeen', 'lastSeen', 'occurrenceCount', 'user_id'])
       .orderBy({ lastSeen: 'desc' }).first(pageSize)),
@@ -422,9 +424,10 @@ export async function bulkSetRuleStatus(
   return { succeeded, failed };
 }
 
-export async function createRun(rule: StoredRule, userId: string, actor: string) {
+export async function createRun(rule: StoredRule, userId: string, actor: string, batchId?: string) {
   const now = new Date();
   return getRayfinClient().data.ReconciliationRun.create({
+    batch_id: batchId,
     rule_id: rule.id,
     ruleVersion: rule.version,
     ruleName: rule.name,

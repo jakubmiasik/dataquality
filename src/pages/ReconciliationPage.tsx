@@ -58,6 +58,7 @@ import {
 import { buildComparisonRows, parseExceptionDetail } from '@/services/exceptionDetail';
 import type { CompareField, Operand, ReconciliationFinding, ReconciliationResult } from '@/services/reconciliationEngine';
 import { summariseSweep } from '@/services/reconciliationScheduler';
+import { describeBatch, findBatch, groupRunsIntoBatches, newBatchId, shortBatchId, type RunBatch } from '@/services/runBatches';
 import { describeSchedule, nextOccurrence, validateSchedule, type ScheduleDefinition } from '@/services/reconciliationSchedule';
 
 type Tab = 'overview' | 'sources' | 'rules' | 'schedules' | 'exceptions' | 'runs' | 'compare' | 'settings';
@@ -305,10 +306,21 @@ export function ReconciliationPage() {
   // so filtering on it silently emptied earlier runs. Findings record run
   // membership permanently and are loaded on demand for the runs in view.
   const runMembershipFor = useCallback((runId: string) => runMembership[runId] ?? null, [runMembership]);
-  const belongsToRun = useCallback((exception: StoredException, runId: string) => {
-    const members = runMembershipFor(runId);
-    return members ? members.includes(exception.id) : exception.lastRunId === runId;
-  }, [runMembershipFor]);
+  const runBatches = useMemo(() => groupRunsIntoBatches(runs), [runs]);
+  /**
+   * Answers "did this batch surface that exception?". Membership is recorded
+   * per run, so a batch is the union across its members. While a member is
+   * still loading it falls back to `lastRunId`, which is right for the newest
+   * batch and the best available answer for older ones.
+   */
+  const belongsToRun = useCallback((exception: StoredException, batchId: string) => {
+    const batch = findBatch(runBatches, batchId);
+    const memberIds = batch ? batch.runs.map((run) => run.id) : [batchId];
+    return memberIds.some((runId) => {
+      const ids = runMembershipFor(runId);
+      return ids ? ids.includes(exception.id) : exception.lastRunId === runId;
+    });
+  }, [runMembershipFor, runBatches]);
 
   const filteredExceptions = useMemo(() => exceptions.filter((exception) => {
     const rule = rules.find((entry) => entry.id === exception.rule_id);
@@ -325,17 +337,29 @@ export function ReconciliationPage() {
     run.status === 'completed' && (comparisonRuleId === ALL_RULES || run.rule_id === comparisonRuleId)
   ), [runs, comparisonRuleId]);
 
-  // Both selectors open on the newest run; falling back rather than seeding state
-  // keeps the default correct when a refresh records a newer run.
-  const overviewRun = useMemo(() => (overviewRunId === ALL_RUNS ? null : runs.find((run) => run.id === overviewRunId) ?? runs[0] ?? null), [runs, overviewRunId]);
+  // Selection is by batch, so a bulk run reads as one result rather than one
+  // entry per rule. Falling back rather than seeding keeps the default on the
+  // newest batch when a refresh records a newer one.
+  const overviewBatch = useMemo(
+    () => (overviewRunId === ALL_RUNS ? null : findBatch(runBatches, overviewRunId) ?? runBatches[0] ?? null),
+    [runBatches, overviewRunId]
+  );
   const exceptionRunDefaulted = useRef(false);
   useEffect(() => {
-    if (exceptionRunDefaulted.current || !runs.length) return;
+    if (exceptionRunDefaulted.current || !runBatches.length) return;
     exceptionRunDefaulted.current = true;
-    setExceptionFilter((current) => current.runId ? current : { ...current, runId: runs[0].id });
-  }, [runs]);
+    setExceptionFilter((current) => current.runId ? current : { ...current, runId: runBatches[0].id });
+  }, [runBatches]);
 
-  const neededRunIds = useMemo(() => [overviewRun?.id, exceptionFilter.runId].filter((id): id is string => Boolean(id)), [overviewRun, exceptionFilter.runId]);
+  // Membership is recorded per run, so a batch needs every member loaded.
+  const exceptionBatch = useMemo(
+    () => (exceptionFilter.runId ? findBatch(runBatches, exceptionFilter.runId) : null),
+    [runBatches, exceptionFilter.runId]
+  );
+  const neededRunIds = useMemo(
+    () => [...new Set([...(overviewBatch?.runs ?? []), ...(exceptionBatch?.runs ?? [])].map((run) => run.id))],
+    [overviewBatch, exceptionBatch]
+  );
   useEffect(() => {
     const missing = neededRunIds.filter((id) => !(id in runMembership));
     if (!missing.length || !userId) return;
@@ -534,14 +558,15 @@ export function ReconciliationPage() {
     finally { setBusyKey(''); }
   }
 
-  async function executeRule(rule: StoredRule): Promise<{ ok: true; runId: string; matched: number; findings: number } | { ok: false; message: string }> {
+  async function executeRule(rule: StoredRule, batchId?: string): Promise<{ ok: true; runId: string; matched: number; findings: number } | { ok: false; message: string }> {
     if (!user) return { ok: false, message: 'Sign in before running rules.' };
     const sourceA = sources.find((source) => source.id === rule.sourceAId);
     const sourceB = sources.find((source) => source.id === rule.sourceBId);
     if (!sourceA || !sourceB) return { ok: false, message: 'The rule is missing one of its saved sources.' };
     if (!rule.enabled || rule.status === 'retired') return { ok: false, message: `${rule.name} is not enabled for runs.` };
     const compareFields = await loadRuleFields(rule.id, user.id);
-    const run = await createRun(rule, user.id, user.name);
+    // Every run belongs to a batch; a lone run simply gets one of its own.
+    const run = await createRun(rule, user.id, user.name, batchId ?? newBatchId());
     try {
       const execution = await callReconciliationGateway<{ result: ReconciliationResult }>('execute', user.email, {
         sources: {
@@ -563,12 +588,14 @@ export function ReconciliationPage() {
     if (!user) return;
     setBusyKey(`run:${rule.id}`);
     setError(null);
+    const batchId = newBatchId();
     try {
-      const result = await executeRule(rule);
+      const result = await executeRule(rule, batchId);
       if (!result.ok) throw new Error(result.message);
-      setNotice(`Run completed: ${result.matched} matched, ${result.findings} findings.`);
+      setNotice(`Run ${shortBatchId(batchId)} completed: ${result.matched} matched, ${result.findings} findings.`);
       await refreshData();
-      setTab('runs');
+      setOverviewRunId(batchId);
+      setTab('overview');
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to run this rule.'); }
     finally { setBusyKey(''); }
   }
@@ -580,14 +607,18 @@ export function ReconciliationPage() {
     setBusyKey('run-selected');
     setError(null);
     let failed = 0;
+    // One batch covers the whole trigger, so the Overview can report every
+    // rule together instead of forcing a rule-by-rule inspection.
+    const batchId = newBatchId();
     try {
       for (const rule of selected) {
-        const result = await executeRule(rule);
+        const result = await executeRule(rule, batchId);
         if (!result.ok) failed += 1;
       }
-      setNotice(`${selected.length} rule${selected.length === 1 ? '' : 's'} run, ${failed} failed.`);
+      setNotice(`Run ${shortBatchId(batchId)}: ${selected.length} rule${selected.length === 1 ? '' : 's'} run, ${failed} failed.`);
       await refreshData();
-      setTab('runs');
+      setOverviewRunId(batchId);
+      setTab('overview');
     } finally { setBusyKey(''); }
   }
 
@@ -879,8 +910,8 @@ export function ReconciliationPage() {
         {!data && tab !== 'settings' && <div className={`${card} px-5 py-8 text-sm text-slate-600`}>{loading ? 'Loading reconciliation data...' : 'No reconciliation data is available yet. Configure the Rayfin data service and refresh.'}</div>}
 
         {tab === 'overview' && data && <OverviewPanel
-          rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
-          selectedRun={overviewRun} selectedRunId={overviewRunId} isInRun={belongsToRun} onSelectRun={setOverviewRunId}
+          rules={rules} runs={runs} batches={runBatches} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
+          selectedBatch={overviewBatch} selectedRunId={overviewRunId} isInRun={belongsToRun} onSelectRun={setOverviewRunId}
           onEditRule={(rule) => { setTab('rules'); void openEditRule(rule); }}
           onReviewExceptions={(patch) => { setExceptionFilter((current) => ({ ...current, severity: '', ruleId: '', ruleGroup: '', ...patch })); setTab('exceptions'); }}
           onNavigate={setTab} onFindOrphans={() => void checkOrphans()} onPurgeOrphans={() => void purgeOrphanRows()}
@@ -951,16 +982,17 @@ export function ReconciliationPage() {
 }
 
 function OverviewPanel({
-  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, selectedRunId, isInRun, onSelectRun, onEditRule, onReviewExceptions, onNavigate, onFindOrphans, onPurgeOrphans,
+  rules, runs, batches, openExceptions, orphanReport, busyKey, selectedBatch, selectedRunId, isInRun, onSelectRun, onEditRule, onReviewExceptions, onNavigate, onFindOrphans, onPurgeOrphans,
 }: {
   rules: StoredRule[];
   runs: StoredRun[];
+  batches: RunBatch[];
   openExceptions: StoredException[];
   orphanReport: OrphanReport | null;
   busyKey: string;
-  selectedRun: StoredRun | null;
+  selectedBatch: RunBatch | null;
   selectedRunId: string;
-  isInRun: (exception: StoredException, runId: string) => boolean;
+  isInRun: (exception: StoredException, batchId: string) => boolean;
   onSelectRun: (id: string) => void;
   onEditRule: (rule: StoredRule) => void;
   onReviewExceptions: (patch: Partial<ExceptionFilter>) => void;
@@ -968,15 +1000,17 @@ function OverviewPanel({
   onFindOrphans: () => void;
   onPurgeOrphans: () => void;
 }) {
-  const scopedToRun = selectedRunId !== ALL_RUNS && Boolean(selectedRun);
-  // Everything derived from exceptions narrows to the chosen run so the page
+  const scopedToRun = selectedRunId !== ALL_RUNS && Boolean(selectedBatch);
+  // Everything derived from exceptions narrows to the chosen batch so the page
   // reads as a report of that run rather than an all-time total.
   const scopedExceptions = useMemo(
-    () => (scopedToRun && selectedRun ? openExceptions.filter((exception) => isInRun(exception, selectedRun.id)) : openExceptions),
-    [openExceptions, scopedToRun, selectedRun, isInRun],
+    () => (scopedToRun && selectedBatch ? openExceptions.filter((exception) => isInRun(exception, selectedBatch.id)) : openExceptions),
+    [openExceptions, scopedToRun, selectedBatch, isInRun],
   );
-  const scopeLabel = scopedToRun && selectedRun ? `${selectedRun.ruleName} · ${formatDate(selectedRun.startedAt)}` : 'All runs';
-  const recentRuns = runs.slice(0, 8);
+  const scopeLabel = scopedToRun && selectedBatch
+    ? `Run ${selectedBatch.shortId} · ${formatDate(selectedBatch.startedAt)}`
+    : 'All runs';
+  const recentBatches = batches.slice(0, 8);
   const groupCounts = ruleGroups.map(([key, label]) => {
     const members = rules.filter((rule) => rule.ruleGroup === key);
     return {
@@ -1012,32 +1046,44 @@ function OverviewPanel({
       </section>
       <section className={card}>
         <SectionTitle title="Last runs" action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">View history</button>} />
-        {recentRuns.length ? <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
-          {recentRuns.map((run) => <tr key={run.id} className={run.id === selectedRun?.id && scopedToRun ? 'bg-brand-50/60' : undefined}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount ? <button type="button" onClick={() => onReviewExceptions({ runId: run.id, status: '' })} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{run.exceptionCount}</button> : run.exceptionCount}</td><td className="px-4 py-3 text-right"><button type="button" onClick={() => onSelectRun(run.id)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Inspect</button></td></tr>)}
+        {recentBatches.length ? <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Run ID</th><th className="px-4 py-2.5">Scope</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
+          {recentBatches.map((batch) => <tr key={batch.id} className={batch.id === selectedBatch?.id && scopedToRun ? 'bg-brand-50/60' : undefined}><td className="px-4 py-3"><code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-700">{batch.shortId}</code></td><td className="px-4 py-3 font-medium">{batch.ruleCount === 1 ? <>{batch.runs[0].ruleName}<span className="ml-2 text-xs text-slate-400">v{batch.runs[0].ruleVersion}</span></> : `${batch.ruleCount} rules`}</td><td className="px-4 py-3 text-slate-600">{formatDate(batch.startedAt)}</td><td className="px-4 py-3"><StatusPill value={batch.status} /></td><td className="px-4 py-3 text-right tabular-nums">{batch.matched}</td><td className="px-4 py-3 text-right tabular-nums">{batch.exceptionCount ? <button type="button" onClick={() => onReviewExceptions({ runId: batch.id, status: '' })} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{batch.exceptionCount}</button> : batch.exceptionCount}</td><td className="px-4 py-3 text-right"><button type="button" onClick={() => onSelectRun(batch.id)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Inspect</button></td></tr>)}
         </tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
       </section>
       <section className={card}>
         <SectionTitle title="Run detail" subtitle="Summary, rule coverage and priority work for the selected run." action={<div className="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span className="rounded-full border border-brand-200 bg-brand-50 px-2.5 py-1 font-semibold text-brand-800">{scopeLabel}</span>{scopedToRun && <button type="button" onClick={() => onSelectRun(ALL_RUNS)} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Show all runs</button>}</div>} />
         <div className="space-y-4 p-4">
           <div className="max-w-xl"><label className={labelClass} htmlFor="overview-run">Run</label>
-            <select id="overview-run" className={input} value={scopedToRun ? selectedRun?.id ?? '' : ALL_RUNS} onChange={(event) => onSelectRun(event.target.value)} disabled={!runs.length}>
-              {runs.length ? [
+            <select id="overview-run" className={input} value={scopedToRun ? selectedBatch?.id ?? '' : ALL_RUNS} onChange={(event) => onSelectRun(event.target.value)} disabled={!batches.length}>
+              {batches.length ? [
                 <option key={ALL_RUNS} value={ALL_RUNS}>All runs</option>,
-                ...runs.map((run) => <option key={run.id} value={run.id}>{run.ruleName} · v{run.ruleVersion} · {formatDate(run.startedAt)}</option>),
+                ...batches.map((batch) => <option key={batch.id} value={batch.id}>{describeBatch(batch, formatDate)}</option>),
               ] : <option value="">No runs recorded</option>}
             </select>
           </div>
           <div className="space-y-3">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Run summary</h3>
-            {selectedRun ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-              <Metric label="Rows read (A)" value={selectedRun.recordsA} accent="slate" onClick={noop} />
-              <Metric label="Rows read (B)" value={selectedRun.recordsB} accent="slate" onClick={noop} />
-              <Metric label="Matched" value={selectedRun.matched} accent="teal" onClick={noop} />
+            {selectedBatch ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+              <Metric label="Rows read (A)" value={selectedBatch.recordsA} accent="slate" onClick={noop} />
+              <Metric label="Rows read (B)" value={selectedBatch.recordsB} accent="slate" onClick={noop} />
+              <Metric label="Matched" value={selectedBatch.matched} accent="teal" onClick={noop} />
               {/* Findings count every exception the run raised, including ones already resolved, so the status filter is cleared. */}
-              <Metric label="Findings" value={selectedRun.exceptionCount} accent="rose" onClick={() => onReviewExceptions({ runId: selectedRun.id, status: '' })} />
-              <Metric label="Open exceptions" value={scopedExceptions.length} accent="rose" onClick={() => onReviewExceptions({ runId: selectedRun.id })} />
-            </div> : runs.length ? <EmptyMessage>Choose a single run to see its totals.</EmptyMessage> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
-            {selectedRun && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Status <StatusPill value={selectedRun.status} /> <span>started {formatDate(selectedRun.startedAt)} · completed {formatDate(selectedRun.completedAt)}{selectedRun.errorMessage ? ` · ${selectedRun.errorMessage}` : ''}</span></p>}
+              <Metric label="Findings" value={selectedBatch.exceptionCount} accent="rose" onClick={() => onReviewExceptions({ runId: selectedBatch.id, status: '' })} />
+              <Metric label="Open exceptions" value={scopedExceptions.length} accent="rose" onClick={() => onReviewExceptions({ runId: selectedBatch.id })} />
+            </div> : batches.length ? <EmptyMessage>Choose a single run to see its totals.</EmptyMessage> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
+            {selectedBatch && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Run <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono font-semibold text-slate-700">{selectedBatch.shortId}</code> <StatusPill value={selectedBatch.status} /> <span>{selectedBatch.ruleCount} rule{selectedBatch.ruleCount === 1 ? '' : 's'} · started {formatDate(selectedBatch.startedAt)} · completed {formatDate(selectedBatch.completedAt)}{selectedBatch.failedCount ? ` · ${selectedBatch.failedCount} failed` : ''}</span></p>}
+            {selectedBatch && selectedBatch.ruleCount > 1 && <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <table className="w-full min-w-[640px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th></tr></thead>
+                <tbody className="divide-y divide-slate-100">{selectedBatch.runs.map((run) => <tr key={run.id}>
+                  <td className="px-4 py-2.5 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td>
+                  <td className="px-4 py-2.5"><StatusPill value={run.status} /></td>
+                  <td className="px-4 py-2.5 text-right tabular-nums">{run.recordsA}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums">{run.recordsB}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums">{run.matched}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums">{run.exceptionCount ? <button type="button" onClick={() => onReviewExceptions({ runId: selectedBatch.id, ruleId: run.rule_id, status: '' })} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{run.exceptionCount}</button> : run.exceptionCount}</td>
+                </tr>)}</tbody></table>
+            </div>}
+            {selectedBatch?.runs.find((run) => run.errorMessage) && <p className="text-xs text-rose-700">{selectedBatch.runs.filter((run) => run.errorMessage).map((run) => `${run.ruleName}: ${run.errorMessage}`).join(' · ')}</p>}
           </div>
           <div className="space-y-3 border-t border-slate-100 pt-4">
             <div className="flex items-center justify-between gap-3">
@@ -1062,7 +1108,7 @@ function OverviewPanel({
           <div className="space-y-3 border-t border-slate-100 pt-4">
             <div className="flex items-center justify-between gap-3">
               <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Priority work</h3>
-              <button type="button" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>
+              <button type="button" onClick={() => onReviewExceptions(scopedToRun && selectedBatch ? { runId: selectedBatch.id } : { runId: '' })} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>
             </div>
             {scopedExceptions.length ? <div className="grid gap-4 sm:grid-cols-3">
               {priorityBySeverity.map((bucket) => <div key={bucket.severity} className="rounded-xl border border-slate-200 px-4 py-3">
@@ -1072,7 +1118,7 @@ function OverviewPanel({
                 </div>
                 {bucket.rules.length ? <ul className="mt-2 space-y-1">
                   {bucket.rules.map((entry) => <li key={entry.ruleId} className="flex items-center justify-between gap-2">
-                    <button type="button" onClick={() => onReviewExceptions({ severity: bucket.severity, ruleId: entry.ruleId, runId: scopedToRun && selectedRun ? selectedRun.id : '' })} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{entry.name}</button>
+                    <button type="button" onClick={() => onReviewExceptions({ severity: bucket.severity, ruleId: entry.ruleId, runId: scopedToRun && selectedBatch ? selectedBatch.id : '' })} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{entry.name}</button>
                     <span className="shrink-0 text-xs tabular-nums text-slate-500">{entry.count}</span>
                   </li>)}
                 </ul> : <p className="mt-2 text-xs text-slate-400">Nothing at this level.</p>}
@@ -1404,7 +1450,18 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   onBulkComment: () => void;
 }) {
   const outcomes = [...new Set(allExceptions.map((exception) => exception.outcome))];
-  const runIds = [...new Set([...runs.map((run) => run.id), ...allExceptions.map((exception) => exception.lastRunId).filter(Boolean)])];
+  // The filter stores a batch id, so the options must be batches. Exceptions
+  // whose run predates batching fall back to their own run id, which
+  // `groupRunsIntoBatches` also uses as the batch key.
+  const batches = useMemo(() => groupRunsIntoBatches(runs), [runs]);
+  const batchOptions = useMemo(() => {
+    const known = new Set(batches.map((batch) => batch.id));
+    const orphans = [...new Set(allExceptions.map((exception) => exception.lastRunId).filter((id): id is string => Boolean(id) && !runs.some((run) => run.id === id)))];
+    return [
+      ...batches.map((batch) => ({ id: batch.id, label: describeBatch(batch, formatDate) })),
+      ...orphans.filter((id) => !known.has(id)).map((id) => ({ id, label: `Deleted run · ${id.slice(0, 8)}` })),
+    ];
+  }, [batches, allExceptions, runs]);
   const toggleSelection = (exceptionId: string, checked: boolean) => onSelectedIds(checked ? [...selectedIds, exceptionId] : selectedIds.filter((id) => id !== exceptionId));
   const visibleIds = exceptions.map((exception) => exception.id);
   // Exceptions are summarised per rule first; the per-key detail is opt-in so a
@@ -1440,7 +1497,7 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   };
   return <div className="grid gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.8fr)]">
     <section className={card}>
-      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{runIds.map((runId) => { const run = runs.find((candidate) => candidate.id === runId); return <option key={runId} value={runId}>{run ? `${run.ruleName} · ${formatDate(run.startedAt)}` : `Deleted run · ${runId.slice(0, 8)}`}</option>; })}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
+      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{batchOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500">
         <label className="flex items-center gap-2"><input type="checkbox" aria-label="Select visible exceptions" checked={visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id))} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...visibleIds])] : selectedIds.filter((id) => !visibleIds.includes(id)))} /><span>{exceptions.length} of {allExceptions.length} exceptions · {selectedIds.length} selected</span></label>
         <div className="flex flex-wrap items-center gap-2">
@@ -1490,7 +1547,7 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
 
 function RunsPanel({ runs, busyKey, onCompare, onDelete }: { runs: StoredRun[]; busyKey: string; onCompare: (run: StoredRun) => void; onDelete: (run: StoredRun) => void }) {
   return <section className={card}><SectionTitle title="Run history" subtitle="Every run retains the rule version, counts, and per-item findings." />
-    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{runs.map((run) => <tr key={run.id}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3">{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Compare</button>}<button type="button" onClick={() => onDelete(run)} disabled={run.status === 'running' || busyKey === `delete-run:${run.id}`} className="text-xs font-semibold text-rose-700 hover:underline disabled:opacity-40">Delete</button></div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
+    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Run ID</th><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{runs.map((run) => <tr key={run.id}><td className="px-4 py-3"><code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-700">{shortBatchId(run.batch_id || run.id)}</code></td><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3">{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Compare</button>}<button type="button" onClick={() => onDelete(run)} disabled={run.status === 'running' || busyKey === `delete-run:${run.id}`} className="text-xs font-semibold text-rose-700 hover:underline disabled:opacity-40">Delete</button></div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
   </section>;
 }
 

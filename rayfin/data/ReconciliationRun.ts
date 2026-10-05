@@ -4,6 +4,12 @@ import { authenticated, date, entity, int, set, text, uuid } from '@microsoft/ra
 @authenticated('*')
 export class ReconciliationRun {
   @uuid() id!: string;
+  /**
+   * Groups the runs started by one trigger, so a bulk run of many rules reads
+   * as a single result in the UI. Optional because runs recorded before
+   * batching existed have none; those are treated as a batch of one.
+   */
+  @text({ max: 64, optional: true }) batch_id?: string;
   @text({ max: 64 }) rule_id!: string;
   @int() ruleVersion!: number;
   @text({ max: 255 }) ruleName!: string;
