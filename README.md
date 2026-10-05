@@ -149,15 +149,23 @@ need a SQL password or app secret.
 ```bash
 cd gateway
 azd env new <environment-name>
-azd env set CORS_ALLOWED_ORIGINS "https://app.fabric.microsoft.com"
+azd env set CORS_ALLOWED_ORIGINS "https://<your-app>.webapp.fabricapps.net,http://localhost:5173"
 azd env set VNET_ENABLED false
 azd up
 ```
 
 `CORS_ALLOWED_ORIGINS` is a comma-separated list of browser origins allowed to
-call the gateway. The Fabric-hosted app is cross-origin, so its origin must be
-listed or every call fails preflight. The deployment wires this into the Function
-App's CORS settings, so no manual portal step is needed.
+call the gateway. Use the origin the app is actually **served from**. A
+Fabric-hosted app runs inside an iframe that has its own origin — something like
+`https://epic-haven-....webapp.fabricapps.net` — and CORS is checked against that
+origin, *not* against `https://app.fabric.microsoft.com`. Listing only the Fabric
+portal origin leaves every call failing preflight. Include a `http://localhost:<port>`
+entry too if you point local dev at the deployed gateway rather than the Vite
+proxy. The deployment wires this into the Function App's CORS settings, so no
+manual portal step is needed.
+
+The app shows its own origin in the **Configuration** tab next to the redirect
+URI, which is the quickest way to read the exact value to list here.
 
 Note the Function App's HTTPS origin from the `azd up` output. It is also
 written to the azd environment as `RECONCILIATION_GATEWAY_URL`, so you can read
@@ -235,9 +243,24 @@ application* on the app registration. Registering it as *Web* instead of *SPA*
 produces the same error, because browser-based auth-code flows require the SPA
 platform.
 
-**Browser calls to the gateway fail CORS preflight.** The app's origin is not in
-the Function App's allowed origins. Re-run `azd env set CORS_ALLOWED_ORIGINS …`
-followed by `azd up` from `gateway/`.
+**"Failed to fetch" / "Could not reach the reconciliation gateway".** The browser
+blocked the request before it reached the gateway, almost always because the
+app's origin is missing from the Function App's allowed origins. Confirm with a
+preflight — a listed origin gets an `Access-Control-Allow-Origin` header back,
+an unlisted one gets nothing:
+
+```bash
+curl -s -D - -o /dev/null -X OPTIONS \
+  -H 'Origin: https://<your-app>.webapp.fabricapps.net' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: authorization,x-sql-access-token,content-type' \
+  https://<function-app>.azurewebsites.net/api/reconciliation/catalog | grep -i access-control
+```
+
+Fix it with `azd env set CORS_ALLOWED_ORIGINS …` followed by `azd provision` from
+`gateway/` (`provision` is enough — the function code is unchanged). If the
+preflight does return the header, check instead that the gateway URL in the
+**Configuration** tab is the right origin.
 
 ### Hardening before production
 

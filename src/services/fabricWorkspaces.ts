@@ -228,16 +228,33 @@ export async function callReconciliationGateway<T>(route: 'catalog' | 'execute',
   const url = base.startsWith('/')
     ? new URL(`${base}reconciliation/${route}`, window.location.origin)
     : new URL(`/api/reconciliation/${route}`, base);
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'x-sql-access-token': sqlAccessToken,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  const result = await response.json() as T & { error?: string };
-  if (!response.ok) throw new Error(result.error || `Reconciliation gateway failed (${response.status}).`);
-  return result;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'x-sql-access-token': sqlAccessToken,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    // fetch only rejects before a response exists: DNS, TLS, refused connection
+    // or a blocked CORS preflight. The browser deliberately hides which one.
+    throw new Error(
+      `Could not reach the reconciliation gateway at ${url.origin}. Check that the URL in the Configuration tab is correct, `
+      + `and that this app's origin (${window.location.origin}) is listed in the Function App's allowed CORS origins.`
+    );
+  }
+
+  let result: (T & { error?: string }) | null = null;
+  try {
+    result = await response.json() as T & { error?: string };
+  } catch {
+    // A gateway that is down or misrouted answers with HTML, not JSON.
+    if (response.ok) throw new Error('The reconciliation gateway returned a response that was not valid JSON.');
+  }
+  if (!response.ok) throw new Error(result?.error || `Reconciliation gateway failed (${response.status}).`);
+  return result as T;
 }

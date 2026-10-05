@@ -59,7 +59,7 @@ param vNetName string = ''
 @description('Id of the user identity to be used for testing and debugging. This is not required in production. Leave empty if not needed.')
 param principalId string = deployer().objectId
 
-@description('Comma-separated browser origins allowed to call the gateway. The Fabric-hosted app runs cross-origin, so set this to the app origin (for example https://app.fabric.microsoft.com) before deploying.')
+@description('Comma-separated browser origins allowed to call the gateway. Use the origin the app is actually served from — a Fabric-hosted app runs in an iframe with its own origin (https://<app>.webapp.fabricapps.net), not https://app.fabric.microsoft.com.')
 param corsAllowedOrigins string = ''
 
 var corsOrigins = empty(trim(corsAllowedOrigins)) ? [] : filter(map(split(corsAllowedOrigins, ','), origin => trim(origin)), origin => !empty(origin))
