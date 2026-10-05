@@ -7,6 +7,12 @@ import type { StoredRun } from '@/services/reconciliationRepository';
  */
 export type RunBatch = {
   id: string;
+  /**
+   * Display sequence, oldest run being #1. Derived from chronological order
+   * rather than stored, so it stays dense and readable; the durable identity
+   * is still `id`.
+   */
+  number: number;
   runs: StoredRun[];
   ruleCount: number;
   startedAt: Date;
@@ -64,6 +70,7 @@ export function groupRunsIntoBatches(runs: StoredRun[]): RunBatch[] {
 
     return {
       id,
+      number: 0,
       runs: ordered,
       ruleCount: new Set(ordered.map((run) => run.rule_id)).size,
       startedAt: asDate(ordered[0].startedAt),
@@ -79,15 +86,24 @@ export function groupRunsIntoBatches(runs: StoredRun[]): RunBatch[] {
     } satisfies RunBatch;
   });
 
-  return batches.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
+  // Newest first for display, but numbered from the oldest so a run keeps the
+  // same number as later runs are added.
+  const newestFirst = batches.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
+  const total = newestFirst.length;
+  return newestFirst.map((batch, index) => ({ ...batch, number: total - index }));
 }
 
-/** Selector caption: identifies the batch by id and scope, not by one rule name. */
+/** User-facing run label, e.g. `Run #12`. */
+export function batchLabel(batch: RunBatch): string {
+  return `Run #${batch.number}`;
+}
+
+/** Selector caption: identifies the batch by number and scope, not by one rule name. */
 export function describeBatch(batch: RunBatch, formatDate: (value: Date) => string): string {
   const scope = batch.ruleCount === 1
     ? batch.runs[0].ruleName
     : `${batch.ruleCount} rules`;
-  return `Run ${batch.shortId} · ${formatDate(batch.startedAt)} · ${scope}`;
+  return `${batchLabel(batch)} · ${formatDate(batch.startedAt)} · ${scope}`;
 }
 
 export function findBatch(batches: RunBatch[], batchId: string): RunBatch | null {
