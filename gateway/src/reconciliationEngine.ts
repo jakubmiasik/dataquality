@@ -89,9 +89,11 @@ export interface ReconciliationResult {
   findings: ReconciliationFinding[];
 }
 
-/** Largest number of rows the gateway will ever project from a source. */
+/** Largest number of rows the gateway will project when a rule asks for a capped read. */
 export const MAX_ROW_LIMIT = 10000;
 export const DEFAULT_ROW_LIMIT = 10000;
+/** Sentinel row limit meaning "read every row", emitted as a SELECT without TOP. */
+export const UNLIMITED_ROW_LIMIT = 0;
 
 const aggregateFunctions = {
   sum: 'SUM',
@@ -200,11 +202,13 @@ export function buildSelectSql({
   rowLimit?: number;
 }): string {
   if (!selections.length) throw new Error('At least one source selection is required.');
-  const limit = Number.isInteger(rowLimit) ? Math.min(Math.max(rowLimit, 1), MAX_ROW_LIMIT) : DEFAULT_ROW_LIMIT;
+  const requested = Number.isInteger(rowLimit) ? rowLimit : DEFAULT_ROW_LIMIT;
+  const unlimited = requested <= UNLIMITED_ROW_LIMIT;
+  const top = unlimited ? '' : `TOP (${Math.min(requested, MAX_ROW_LIMIT)}) `;
   const parts = selections.map(selectionSql);
   const hasAggregate = selections.some((selection) => selection.kind === 'aggregate');
   const groups = parts.flatMap((part) => part.groupBy ? [part.groupBy] : []);
-  const sql = `SELECT TOP (${limit}) ${parts.map((part) => part.projection).join(', ')} FROM ${quoteIdentifier(dataset)}`;
+  const sql = `SELECT ${top}${parts.map((part) => part.projection).join(', ')} FROM ${quoteIdentifier(dataset)}`;
   return hasAggregate && groups.length ? `${sql} GROUP BY ${groups.join(', ')}` : sql;
 }
 

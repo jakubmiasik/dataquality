@@ -1,4 +1,4 @@
-import { compareFindings, metricDelta, validateCompareFields, MAX_ROW_LIMIT, type CompareField, type ReconciliationFinding, type ReconciliationRule, type ReconciliationResult } from './reconciliationEngine';
+import { compareFindings, metricDelta, validateCompareFields, MAX_ROW_LIMIT, UNLIMITED_ROW_LIMIT, type CompareField, type ReconciliationFinding, type ReconciliationRule, type ReconciliationResult } from './reconciliationEngine';
 import { getRayfinClient } from './rayfinClient';
 import { nextOccurrence, validateSchedule, type ScheduleDefinition } from './reconciliationSchedule';
 import type { FabricItem } from './fabricWorkspaces';
@@ -120,6 +120,17 @@ const scheduleColumns = [
   'id', 'rule_id', 'ruleName', 'enabled', 'cadence', 'intervalCount', 'hourUtc', 'minuteUtc',
   'dayOfWeek', 'nextDueAt', 'lastTriggeredAt', 'lastRunId', 'lastStatus', 'lastError', 'user_id',
 ] as const;
+
+/**
+ * An omitted row limit keeps the capped default, while an explicit zero or
+ * negative value is the caller asking for every row.
+ */
+export function normalizeRowLimit(value: unknown): number {
+  if (value === undefined || value === null || value === '') return MAX_ROW_LIMIT;
+  const numeric = Math.trunc(Number(value));
+  if (!Number.isFinite(numeric) || numeric <= 0) return UNLIMITED_ROW_LIMIT;
+  return Math.min(numeric, MAX_ROW_LIMIT);
+}
 
 /**
  * Rayfin stores these columns as NVARCHAR with a hard cap, so an oversized
@@ -302,7 +313,7 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
     ruleGroup: draft.ruleGroup as never,
     duplicateHandling: draft.duplicateHandling ?? 'exception',
     incompleteKeyHandling: draft.incompleteKeyHandling ?? 'exception',
-    rowLimit: Math.min(Math.max(Math.trunc(Number(draft.rowLimit) || MAX_ROW_LIMIT), 1), MAX_ROW_LIMIT),
+    rowLimit: normalizeRowLimit(draft.rowLimit),
     updatedAt: now,
     updatedBy: actor,
     user_id: current ? current.user_id : userId,
@@ -555,6 +566,80 @@ export async function compareRuns(from: StoredRun, to: StoredRun, _userId?: stri
       matched: metricDelta(pick(beforeSummary, earlier, 'matched'), pick(afterSummary, later, 'matched')),
       exceptionCount: metricDelta(earlier.exceptionCount, later.exceptionCount),
     },
+  };
+}
+
+export interface PortfolioRuleComparison {
+  ruleId: string;
+  ruleName: string;
+  result: Awaited<ReturnType<typeof compareRuns>>;
+}
+
+export interface PortfolioComparison {
+  aggregate: Awaited<ReturnType<typeof compareRuns>>;
+  perRule: PortfolioRuleComparison[];
+  rulesCompared: number;
+  rulesSkipped: number;
+}
+
+/**
+ * Diffs every rule between two moments at once. Findings are fingerprinted per
+ * rule, so runs of different rules can never be diffed directly — instead each
+ * rule is paired with its own latest completed run at or before each moment and
+ * the per-rule results are summed into one portfolio verdict.
+ */
+export async function comparePortfolio(runs: StoredRun[], earlierAt: Date, laterAt: Date, userId?: string): Promise<PortfolioComparison> {
+  const [low, high] = earlierAt.valueOf() <= laterAt.valueOf() ? [earlierAt, laterAt] : [laterAt, earlierAt];
+  const completed = runs.filter((run) => run.status === 'completed');
+  const latestAtOrBefore = (candidates: StoredRun[], moment: Date) => candidates
+    .filter((run) => run.startedAt.valueOf() <= moment.valueOf())
+    .sort((first, second) => second.startedAt.valueOf() - first.startedAt.valueOf())[0];
+
+  const pairs = [...new Set(completed.map((run) => run.rule_id))].flatMap((ruleId) => {
+    const forRule = completed.filter((run) => run.rule_id === ruleId);
+    const from = latestAtOrBefore(forRule, low);
+    const to = latestAtOrBefore(forRule, high);
+    // A rule with no run before the earlier moment, or the same run on both
+    // sides, has nothing to say about the period and is reported as skipped.
+    if (!from || !to || from.id === to.id) return [];
+    return [{ ruleId, from, to }];
+  });
+
+  const perRule = await Promise.all(pairs.map(async (pair) => ({
+    ruleId: pair.ruleId,
+    ruleName: pair.to.ruleName,
+    result: await compareRuns(pair.from, pair.to, userId),
+  })));
+
+  const newlyFailing = perRule.flatMap((entry) => entry.result.newlyFailing);
+  const fixed = perRule.flatMap((entry) => entry.result.fixed);
+  const stillFailing = perRule.flatMap((entry) => entry.result.stillFailing);
+  const changed = perRule.flatMap((entry) => entry.result.changed);
+  const metricKeys = ['recordsA', 'recordsB', 'keysCompared', 'matched', 'exceptionCount'] as const;
+  const metrics = Object.fromEntries(metricKeys.map((key) => [key, metricDelta(
+    perRule.reduce((total, entry) => total + entry.result.metrics[key].from, 0),
+    perRule.reduce((total, entry) => total + entry.result.metrics[key].to, 0),
+  )])) as Awaited<ReturnType<typeof compareRuns>>['metrics'];
+
+  const beforeCount = fixed.length + stillFailing.length;
+  const verdict = !beforeCount && !newlyFailing.length && !stillFailing.length ? 'clean' as const
+    : newlyFailing.length && fixed.length ? 'churn' as const
+      : newlyFailing.length ? 'worse' as const
+        : fixed.length ? 'better' as const
+          : changed.length ? 'churn' as const : 'unchanged' as const;
+
+  const sortedFrom = perRule.map((entry) => entry.result.from).sort((first, second) => first.startedAt.valueOf() - second.startedAt.valueOf());
+  const sortedTo = perRule.map((entry) => entry.result.to).sort((first, second) => second.startedAt.valueOf() - first.startedAt.valueOf());
+  return {
+    aggregate: {
+      from: sortedFrom[0],
+      to: sortedTo[0],
+      reversed: earlierAt.valueOf() > laterAt.valueOf(),
+      newlyFailing, fixed, stillFailing, changed, verdict, metrics,
+    },
+    perRule: perRule.sort((first, second) => second.result.newlyFailing.length - first.result.newlyFailing.length),
+    rulesCompared: perRule.length,
+    rulesSkipped: [...new Set(completed.map((run) => run.rule_id))].length - perRule.length,
   };
 }
 

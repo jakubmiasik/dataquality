@@ -38,6 +38,21 @@ test('execution accepts a structured bounded rule, not raw query strings', async
   assert.equal((await validateRequest({ source, leftQuery: 'SELECT * FROM dbo.Invoices' })).request, undefined);
 });
 
+test('execution accepts rowLimit 0 as the all-rows sentinel', async () => {
+  const validated = await validateRequest({
+    sources: { a: source, b: { ...source, itemId: '795abb75-9db7-46df-b079-923abe9ce016', itemType: 'Lakehouse' } },
+    rule: {
+      keyFieldA: 'InvoiceNumber',
+      keyFieldB: 'Invoice_No',
+      datasetA: 'dbo.Invoices',
+      datasetB: 'dbo.InvoiceView',
+      rowLimit: 0,
+      compareFields: [{ label: 'Amount', type: 'number', a: { kind: 'field', value: 'Amount' }, b: { kind: 'field', value: 'Amount' } }],
+    },
+  });
+  assert.equal(validated.request?.rule.rowLimit, 0);
+});
+
 test('execution rejects write-capable SQL expressions and excessive row limits', async () => {
   const base = {
     sources: { a: source, b: { ...source, itemId: '795abb75-9db7-46df-b079-923abe9ce016', itemType: 'Lakehouse' } },

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { getRayfinClient } = vi.hoisted(() => ({ getRayfinClient: vi.fn() }));
 vi.mock('@/services/rayfinClient', () => ({ getRayfinClient }));
 
-import { claimSchedule, setRuleEnabled, type StoredRule, type StoredSchedule } from '@/services/reconciliationRepository';
+import { claimSchedule, comparePortfolio, normalizeRowLimit, setRuleEnabled, type StoredRule, type StoredRun, type StoredSchedule } from '@/services/reconciliationRepository';
 import type { CompareField } from '@/services/reconciliationEngine';
 
 type Row = Record<string, unknown>;
@@ -165,5 +165,69 @@ describe('claimSchedule', () => {
     getRayfinClient.mockReturnValue(client);
 
     await expect(claimSchedule(schedule as unknown as StoredSchedule, dueAt)).resolves.toBe(false);
+  });
+});
+
+describe('normalizeRowLimit', () => {
+  it('keeps the capped default when no limit was supplied', () => {
+    expect(normalizeRowLimit(undefined)).toBe(10000);
+    expect(normalizeRowLimit(null)).toBe(10000);
+    expect(normalizeRowLimit('')).toBe(10000);
+  });
+
+  it('treats an explicit zero as "read every row" and caps everything else', () => {
+    expect(normalizeRowLimit(0)).toBe(0);
+    expect(normalizeRowLimit(250)).toBe(250);
+    expect(normalizeRowLimit(999999)).toBe(10000);
+  });
+});
+
+describe('comparePortfolio', () => {
+  const run = (id: string, ruleId: string, startedAt: string, exceptionCount: number): Row => ({
+    id, rule_id: ruleId, ruleName: `Rule ${ruleId}`, ruleVersion: 1, status: 'completed',
+    recordsA: 10, recordsB: 10, keysCompared: 10, matched: 10 - exceptionCount, exceptionCount,
+    summaryJson: '{}', startedAt: new Date(startedAt), runBy: 'Tester',
+  });
+  const finding = (runId: string, ruleId: string, fingerprint: string): Row => ({
+    id: `${runId}-${fingerprint}`, run_id: runId, rule_id: ruleId, fingerprint,
+    businessKey: fingerprint, outcome: 'value_mismatch', severity: 'medium',
+    detailJson: '{}', recordedAt: new Date(), user_id: 'user-1',
+  });
+
+  it('pairs every rule with its own runs and sums the per-rule results', async () => {
+    const runs = [
+      run('a-old', 'rule-a', '2026-01-01T00:00:00.000Z', 1),
+      run('a-new', 'rule-a', '2026-01-03T00:00:00.000Z', 1),
+      run('b-old', 'rule-b', '2026-01-01T00:00:00.000Z', 1),
+      run('b-new', 'rule-b', '2026-01-03T00:00:00.000Z', 0),
+    ];
+    const { client } = fakeClient({
+      ReconciliationFinding: [
+        finding('a-old', 'rule-a', 'a-key-1'),
+        finding('a-new', 'rule-a', 'a-key-2'),
+        finding('b-old', 'rule-b', 'b-key-1'),
+      ],
+    });
+    getRayfinClient.mockReturnValue(client);
+
+    const result = await comparePortfolio(runs as unknown as StoredRun[], new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-04T00:00:00.000Z'));
+
+    expect(result.rulesCompared).toBe(2);
+    // rule-a swapped one finding for another, rule-b fixed its only finding.
+    expect(result.aggregate.newlyFailing.map((entry) => entry.fingerprint)).toEqual(['a-key-2']);
+    expect(result.aggregate.fixed.map((entry) => entry.fingerprint).sort()).toEqual(['a-key-1', 'b-key-1']);
+    expect(result.aggregate.verdict).toBe('churn');
+    expect(result.aggregate.metrics.exceptionCount).toMatchObject({ from: 2, to: 1, delta: -1 });
+  });
+
+  it('skips a rule with no run before the earlier moment', async () => {
+    const runs = [run('a-new', 'rule-a', '2026-01-03T00:00:00.000Z', 0)];
+    const { client } = fakeClient({ ReconciliationFinding: [] });
+    getRayfinClient.mockReturnValue(client);
+
+    const result = await comparePortfolio(runs as unknown as StoredRun[], new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-04T00:00:00.000Z'));
+
+    expect(result.rulesCompared).toBe(0);
+    expect(result.rulesSkipped).toBe(1);
   });
 });
