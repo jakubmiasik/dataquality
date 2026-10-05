@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import { useAuth } from '@/hooks/AuthContext';
 import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
@@ -23,7 +23,6 @@ import {
   failRun,
   findOrphans,
   loadExceptionEvents,
-  loadRunFindings,
   loadReconciliationData,
   loadRuleFields,
   loadRuleVersions,
@@ -53,6 +52,7 @@ import {
   type SettingKey,
   type SettingValues,
 } from '@/services/appSettings';
+import { buildComparisonRows, parseExceptionDetail } from '@/services/exceptionDetail';
 import type { CompareField, Operand, ReconciliationFinding, ReconciliationResult } from '@/services/reconciliationEngine';
 import { summariseSweep } from '@/services/reconciliationScheduler';
 import { describeSchedule, nextOccurrence, validateSchedule, type ScheduleDefinition } from '@/services/reconciliationSchedule';
@@ -72,6 +72,8 @@ interface CatalogResponse {
 const defaultTabCaption = 'Read-only SQL checks across accessible Fabric sources.';
 /** Sentinel rule selection that compares every rule between two moments at once. */
 const ALL_RULES = '__all__';
+/** Overview run selection that widens the summary back to every run. */
+const ALL_RUNS = '__all_runs__';
 const tabs: Array<{ id: Tab; label: string; caption?: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'sources', label: 'Sources' },
@@ -151,16 +153,24 @@ function humanOutcome(value: string) {
   return value.replaceAll('_', ' ');
 }
 
-function parseExceptionDetail(exception: StoredException) {
-  try {
-    return JSON.parse(exception.detailJson) as {
-      valuesA?: Record<string, unknown> | null;
-      valuesB?: Record<string, unknown> | null;
-      differences?: Array<{ field: string; valueA?: unknown; valueB?: unknown; difference?: number | null; reason?: string }>;
-    };
-  } catch {
-    return { valuesA: null, valuesB: null, differences: [] };
-  }
+
+
+/**
+ * Native `window.confirm`/`window.prompt` are suppressed inside the sandboxed
+ * iframe Fabric hosts the app in, so every bulk action that relied on them
+ * silently did nothing. These in-app dialogs work everywhere.
+ */
+interface DialogRequest {
+  kind: 'confirm' | 'prompt';
+  title: string;
+  message?: string;
+  label?: string;
+  defaultValue?: string;
+  placeholder?: string;
+  confirmLabel?: string;
+  tone?: 'default' | 'danger';
+  requireValue?: boolean;
+  resolve: (value: string | null) => void;
 }
 
 export function ReconciliationPage() {
@@ -174,8 +184,7 @@ export function ReconciliationPage() {
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [draft, setDraft] = useState<RuleDraft | null>(null);
   const [selectedException, setSelectedException] = useState<StoredException | null>(null);
-  const [selectedRun, setSelectedRun] = useState<StoredRun | null>(null);
-  const [runFindings, setRunFindings] = useState<ReconciliationFinding[]>([]);
+  const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [exceptionEvents, setExceptionEvents] = useState<Array<Record<string, unknown>>>([]);
   const [versionHistory, setVersionHistory] = useState<Array<Record<string, unknown>> | null>(null);
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
@@ -195,7 +204,6 @@ export function ReconciliationPage() {
   const [closeReason, setCloseReason] = useState('');
   const selectedExceptionId = selectedException?.id;
   const selectedExceptionOwner = selectedException?.owner ?? '';
-  const selectedRunId = selectedRun?.id;
   const [loading, setLoading] = useState(false);
   const [registrationLoading, setRegistrationLoading] = useState(false);
   const [busyKey, setBusyKey] = useState('');
@@ -239,14 +247,21 @@ export function ReconciliationPage() {
     return () => { cancelled = true; };
   }, [selectedExceptionId, selectedExceptionOwner, userId]);
 
-  useEffect(() => {
-    if (!selectedRunId || !userId) { setRunFindings([]); return; }
-    let cancelled = false;
-    loadRunFindings(selectedRunId, userId)
-      .then((findings) => { if (!cancelled) setRunFindings(findings); })
-      .catch(() => { if (!cancelled) setRunFindings([]); });
-    return () => { cancelled = true; };
-  }, [selectedRunId, userId]);
+  const askDialog = useCallback((request: Omit<DialogRequest, 'resolve'>) => new Promise<string | null>((resolve) => {
+    setDialog({ ...request, resolve });
+  }), []);
+
+  const askConfirm = useCallback(async (request: Omit<DialogRequest, 'resolve' | 'kind'>) => {
+    const answer = await askDialog({ ...request, kind: 'confirm' });
+    return answer !== null;
+  }, [askDialog]);
+
+  const askPrompt = useCallback((request: Omit<DialogRequest, 'resolve' | 'kind'>) => askDialog({ ...request, kind: 'prompt' }), [askDialog]);
+
+  function closeDialog(value: string | null) {
+    dialog?.resolve(value);
+    setDialog(null);
+  }
 
   const sources = data?.sources ?? [];
   const rules = useMemo(() => data?.rules ?? [], [data]);
@@ -283,7 +298,7 @@ export function ReconciliationPage() {
 
   // Both selectors open on the newest run; falling back rather than seeding state
   // keeps the default correct when a refresh records a newer run.
-  const overviewRun = useMemo(() => runs.find((run) => run.id === overviewRunId) ?? runs[0] ?? null, [runs, overviewRunId]);
+  const overviewRun = useMemo(() => (overviewRunId === ALL_RUNS ? null : runs.find((run) => run.id === overviewRunId) ?? runs[0] ?? null), [runs, overviewRunId]);
   const exceptionRunDefaulted = useRef(false);
   useEffect(() => {
     if (exceptionRunDefaulted.current || !runs.length) return;
@@ -549,8 +564,8 @@ export function ReconciliationPage() {
 
   async function retireSelectedRule(rule: StoredRule) {
     if (!user) return;
-    if (!window.confirm(`Retire "${rule.name}"? Retired rules cannot be run or re-enabled from this page.`)) return;
-    const reason = window.prompt('Optional retirement reason', 'Rule retired from the reconciliation workspace') ?? undefined;
+    if (!await askConfirm({ title: 'Retire rule', message: `Retire "${rule.name}"? Retired rules cannot be run or re-enabled from this page.`, confirmLabel: 'Retire rule', tone: 'danger' })) return;
+    const reason = (await askPrompt({ title: 'Retirement reason', label: 'Optional retirement reason', defaultValue: 'Rule retired from the reconciliation workspace', confirmLabel: 'Retire rule', tone: 'danger' })) ?? undefined;
     setBusyKey(`retire:${rule.id}`);
     setError(null);
     try {
@@ -635,7 +650,7 @@ export function ReconciliationPage() {
   }
 
   async function removeSchedule(scheduleId: string) {
-    if (!window.confirm('Delete this schedule?')) return;
+    if (!await askConfirm({ title: 'Delete schedule', message: 'Delete this schedule? It will stop running automatically.', confirmLabel: 'Delete schedule', tone: 'danger' })) return;
     setBusyKey(`schedule:${scheduleId}`);
     setError(null);
     try {
@@ -650,22 +665,31 @@ export function ReconciliationPage() {
     if (!user) return;
     const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
     if (!selected.length) { setError('Select at least one exception.'); return; }
-    const reason = status === 'resolved' || status === 'accepted' ? window.prompt(`Reason for marking ${status}`)?.trim() : undefined;
-    if ((status === 'resolved' || status === 'accepted') && !reason) { setError('A reason is required when resolving or accepting exceptions.'); return; }
+    const needsReason = status === 'resolved' || status === 'accepted';
+    let reason: string | undefined;
+    if (needsReason) {
+      const answer = await askPrompt({ title: `Mark ${selected.length} exception${selected.length === 1 ? '' : 's'} as ${status}`, label: `Reason for marking ${status}`, placeholder: 'Explain why these exceptions are being closed', requireValue: true, confirmLabel: `Mark ${status}` });
+      if (answer === null) return;
+      reason = answer.trim();
+      if (!reason) { setError('A reason is required when resolving or accepting exceptions.'); return; }
+    }
     await applyBulkExceptionAction(selected, { kind: 'status', status, reason });
   }
 
   async function bulkExceptionAssign() {
     const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
     if (!selected.length) { setError('Select at least one exception.'); return; }
-    const owner = window.prompt('Assign selected exceptions to owner (leave blank to clear)', '') ?? '';
-    await applyBulkExceptionAction(selected, { kind: 'assign', owner });
+    const owner = await askPrompt({ title: 'Assign owner', label: 'Assign selected exceptions to owner', message: 'Leave blank to clear the current owner.', defaultValue: '', placeholder: 'name@contoso.com', confirmLabel: 'Assign' });
+    if (owner === null) return;
+    await applyBulkExceptionAction(selected, { kind: 'assign', owner: owner.trim() });
   }
 
   async function bulkExceptionComment() {
     const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
     if (!selected.length) { setError('Select at least one exception.'); return; }
-    const comment = window.prompt('Comment to add to selected exceptions')?.trim();
+    const answer = await askPrompt({ title: 'Add comment', label: 'Comment to add to selected exceptions', placeholder: 'Add context for the team', requireValue: true, confirmLabel: 'Add comment' });
+    if (answer === null) return;
+    const comment = answer.trim();
     if (!comment) { setError('Enter a comment for the selected exceptions.'); return; }
     await applyBulkExceptionAction(selected, { kind: 'comment', comment });
   }
@@ -687,12 +711,11 @@ export function ReconciliationPage() {
   }
 
   async function removeRun(run: StoredRun) {
-    if (!window.confirm(`Delete run for "${run.ruleName}" started ${formatDate(run.startedAt)}?`)) return;
+    if (!await askConfirm({ title: 'Delete run', message: `Delete run for "${run.ruleName}" started ${formatDate(run.startedAt)}? Findings are removed and exceptions are repointed.`, confirmLabel: 'Delete run', tone: 'danger' })) return;
     setBusyKey(`delete-run:${run.id}`);
     setError(null);
     try {
       const result = await deleteRun(run.id);
-      if (selectedRun?.id === run.id) setSelectedRun(null);
       setNotice(`Run deleted. ${result.findingsDeleted} finding${result.findingsDeleted === 1 ? '' : 's'} deleted, ${result.exceptionsRepointed} exception${result.exceptionsRepointed === 1 ? '' : 's'} repointed.`);
       await refreshData();
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to delete this run.'); }
@@ -708,7 +731,7 @@ export function ReconciliationPage() {
   }
 
   async function purgeOrphanRows() {
-    if (!window.confirm('Purge orphaned runs, exceptions, findings, schedules, and events?')) return;
+    if (!await askConfirm({ title: 'Purge orphaned rows', message: 'Purge orphaned runs, exceptions, findings, schedules, and events? This cannot be undone.', confirmLabel: 'Purge', tone: 'danger' })) return;
     setBusyKey('purge-orphans');
     setError(null);
     try {
@@ -812,8 +835,9 @@ export function ReconciliationPage() {
 
         {tab === 'overview' && data && <OverviewPanel
           rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
-          selectedRun={overviewRun} onSelectRun={setOverviewRunId}
+          selectedRun={overviewRun} selectedRunId={overviewRunId} onSelectRun={setOverviewRunId}
           onEditRule={(rule) => { setTab('rules'); void openEditRule(rule); }}
+          onReviewExceptions={(patch) => { setExceptionFilter((current) => ({ ...current, severity: '', ruleId: '', ruleGroup: '', ...patch })); setTab('exceptions'); }}
           onNavigate={setTab} onFindOrphans={() => void checkOrphans()} onPurgeOrphans={() => void purgeOrphanRows()}
         />}
         {tab === 'sources' && <SourcesPanel
@@ -846,7 +870,7 @@ export function ReconciliationPage() {
           onStatus={(status) => void changeExceptionStatus(status)} onSelectedIds={setSelectedExceptionIds}
           onBulkStatus={(status) => void bulkExceptionStatus(status)} onBulkAssign={() => void bulkExceptionAssign()} onBulkComment={() => void bulkExceptionComment()}
         />}
-        {tab === 'runs' && data && <RunsPanel runs={runs} selectedRun={selectedRun} findings={runFindings} busyKey={busyKey} onDetails={setSelectedRun} onDelete={(run) => void removeRun(run)} onCompare={(run) => {
+        {tab === 'runs' && data && <RunsPanel runs={runs} busyKey={busyKey} onDelete={(run) => void removeRun(run)} onCompare={(run) => {
           setComparisonRuleId(run.rule_id);
           const sameRule = runs.filter((candidate) => candidate.rule_id === run.rule_id && candidate.status === 'completed');
           setFromRunId(sameRule[1]?.id ?? '');
@@ -875,12 +899,13 @@ export function ReconciliationPage() {
         busyKey={busyKey} onFilter={setRegistrationFilter} onSelect={(workspace, item) => void registerSource(workspace, item)}
         onClose={() => { setRegistrationOpen(false); setRegistrationSide(null); }}
       />}
+      {dialog && <PromptDialog request={dialog} onResolve={closeDialog} />}
     </div>
   );
 }
 
 function OverviewPanel({
-  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, onSelectRun, onEditRule, onNavigate, onFindOrphans, onPurgeOrphans,
+  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, selectedRunId, onSelectRun, onEditRule, onReviewExceptions, onNavigate, onFindOrphans, onPurgeOrphans,
 }: {
   rules: StoredRule[];
   runs: StoredRun[];
@@ -888,12 +913,22 @@ function OverviewPanel({
   orphanReport: OrphanReport | null;
   busyKey: string;
   selectedRun: StoredRun | null;
+  selectedRunId: string;
   onSelectRun: (id: string) => void;
   onEditRule: (rule: StoredRule) => void;
+  onReviewExceptions: (patch: Partial<ExceptionFilter>) => void;
   onNavigate: (tab: Tab) => void;
   onFindOrphans: () => void;
   onPurgeOrphans: () => void;
 }) {
+  const scopedToRun = selectedRunId !== ALL_RUNS && Boolean(selectedRun);
+  // Everything derived from exceptions narrows to the chosen run so the page
+  // reads as a report of that run rather than an all-time total.
+  const scopedExceptions = useMemo(
+    () => (scopedToRun && selectedRun ? openExceptions.filter((exception) => exception.lastRunId === selectedRun.id) : openExceptions),
+    [openExceptions, scopedToRun, selectedRun],
+  );
+  const scopeLabel = scopedToRun && selectedRun ? `${selectedRun.ruleName} · ${formatDate(selectedRun.startedAt)}` : 'All runs';
   const recentRuns = runs.slice(0, 8);
   const groupCounts = ruleGroups.map(([key, label]) => {
     const members = rules.filter((rule) => rule.ruleGroup === key);
@@ -901,23 +936,42 @@ function OverviewPanel({
       key, label, members,
       total: members.length,
       active: members.filter((rule) => rule.enabled).length,
-      exceptions: openExceptions.filter((exception) => rules.find((rule) => rule.id === exception.rule_id)?.ruleGroup === key).length,
+      exceptions: scopedExceptions.filter((exception) => rules.find((rule) => rule.id === exception.rule_id)?.ruleGroup === key).length,
     };
   }).filter((group) => group.total > 0);
+  const priorityBySeverity = severities.map((severity) => {
+    const matching = scopedExceptions.filter((exception) => exception.severity === severity);
+    const byRule = new Map<string, { ruleId: string; name: string; count: number }>();
+    for (const exception of matching) {
+      const entry = byRule.get(exception.rule_id)
+        ?? { ruleId: exception.rule_id, name: rules.find((rule) => rule.id === exception.rule_id)?.name ?? 'Deleted rule', count: 0 };
+      entry.count += 1;
+      byRule.set(exception.rule_id, entry);
+    }
+    return { severity, total: matching.length, rules: [...byRule.values()].sort((a, b) => b.count - a.count) };
+  });
   return (
     <div className="space-y-6">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+        <span className="font-semibold uppercase tracking-wide">Showing</span>
+        <span className="rounded-full border border-brand-200 bg-brand-50 px-2.5 py-1 font-semibold text-brand-800">{scopeLabel}</span>
+        {scopedToRun && <button type="button" onClick={() => onSelectRun(ALL_RUNS)} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Show all runs</button>}
+      </div>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Active rules" value={rules.filter((rule) => rule.enabled).length} accent="brand" onClick={() => onNavigate('rules')} />
         <Metric label="Draft rules" value={rules.filter((rule) => rule.status === 'draft').length} accent="slate" onClick={() => onNavigate('rules')} />
-        <Metric label="Open exceptions" value={openExceptions.length} accent="rose" onClick={() => onNavigate('exceptions')} />
+        <Metric label={scopedToRun ? 'Open exceptions in run' : 'Open exceptions'} value={scopedExceptions.length} accent="rose" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} />
         <Metric label="Completed runs" value={runs.filter((run) => run.status === 'completed').length} accent="teal" onClick={() => onNavigate('runs')} />
       </div>
       <section className={card}>
         <SectionTitle title="Run summary" subtitle="Showing the most recent run until you choose another." action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Run history</button>} />
         <div className="space-y-4 p-4">
           <div className="max-w-xl"><label className={labelClass} htmlFor="overview-run">Run</label>
-            <select id="overview-run" className={input} value={selectedRun?.id ?? ''} onChange={(event) => onSelectRun(event.target.value)} disabled={!runs.length}>
-              {runs.length ? runs.map((run) => <option key={run.id} value={run.id}>{run.ruleName} · v{run.ruleVersion} · {formatDate(run.startedAt)}</option>) : <option value="">No runs recorded</option>}
+            <select id="overview-run" className={input} value={scopedToRun ? selectedRun?.id ?? '' : ALL_RUNS} onChange={(event) => onSelectRun(event.target.value)} disabled={!runs.length}>
+              {runs.length ? [
+                <option key={ALL_RUNS} value={ALL_RUNS}>All runs</option>,
+                ...runs.map((run) => <option key={run.id} value={run.id}>{run.ruleName} · v{run.ruleVersion} · {formatDate(run.startedAt)}</option>),
+              ] : <option value="">No runs recorded</option>}
             </select>
           </div>
           {selectedRun ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -925,7 +979,7 @@ function OverviewPanel({
             <Metric label="Rows read (B)" value={selectedRun.recordsB} accent="slate" onClick={noop} />
             <Metric label="Matched" value={selectedRun.matched} accent="teal" onClick={noop} />
             <Metric label="Findings" value={selectedRun.exceptionCount} accent="rose" onClick={noop} />
-          </div> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
+          </div> : runs.length ? <EmptyMessage>Choose a single run to see its totals.</EmptyMessage> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
           {selectedRun && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Status <StatusPill value={selectedRun.status} /> <span>started {formatDate(selectedRun.startedAt)} · completed {formatDate(selectedRun.completedAt)}{selectedRun.errorMessage ? ` · ${selectedRun.errorMessage}` : ''}</span></p>}
         </div>
       </section>
@@ -953,8 +1007,21 @@ function OverviewPanel({
         </tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
       </section>
       <section className={card}>
-        <SectionTitle title="Priority work" action={<button type="button" onClick={() => onNavigate('exceptions')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>} />
-        {openExceptions.length ? <ul className="divide-y divide-slate-100">{openExceptions.slice(0, 6).map((exception) => <li key={exception.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div><p className="text-sm font-medium">{exception.businessKey}</p><p className="mt-0.5 text-xs text-slate-500">{humanOutcome(exception.outcome)} · last seen {formatDate(exception.lastSeen)}</p></div><div className="flex items-center gap-3"><SeverityPill value={exception.severity} /><span className="text-xs text-slate-500">{exception.occurrenceCount} occurrence{exception.occurrenceCount === 1 ? '' : 's'}</span></div></li>)}</ul> : <EmptyMessage>No active exceptions.</EmptyMessage>}
+        <SectionTitle title="Priority work" subtitle="Open exceptions grouped by importance, by rule." action={<button type="button" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>} />
+        {scopedExceptions.length ? <div className="grid divide-y divide-slate-100 p-4 sm:grid-cols-3 sm:gap-4 sm:divide-y-0">
+          {priorityBySeverity.map((bucket) => <div key={bucket.severity} className="pt-3 first:pt-0 sm:pt-0">
+            <div className="flex items-center justify-between gap-3">
+              <SeverityPill value={bucket.severity} />
+              <span className="text-sm font-semibold tabular-nums text-slate-700">{bucket.total}</span>
+            </div>
+            {bucket.rules.length ? <ul className="mt-2 space-y-1">
+              {bucket.rules.map((entry) => <li key={entry.ruleId} className="flex items-center justify-between gap-2">
+                <button type="button" onClick={() => onReviewExceptions({ severity: bucket.severity, ruleId: entry.ruleId, runId: scopedToRun && selectedRun ? selectedRun.id : '' })} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{entry.name}</button>
+                <span className="shrink-0 text-xs tabular-nums text-slate-500">{entry.count}</span>
+              </li>)}
+            </ul> : <p className="mt-2 text-xs text-slate-400">Nothing at this level.</p>}
+          </div>)}
+        </div> : <EmptyMessage>No active exceptions{scopedToRun ? ' for this run' : ''}.</EmptyMessage>}
       </section>
       <section className={card}>
         <SectionTitle title="Maintenance" subtitle="Find and purge reconciliation rows whose owning rule no longer exists." action={<div className="flex gap-2"><button type="button" onClick={onFindOrphans} disabled={busyKey === 'orphans'} className={secondaryButton}>{busyKey === 'orphans' ? 'Checking...' : 'Check orphans'}</button><button type="button" onClick={onPurgeOrphans} disabled={busyKey === 'purge-orphans'} className={dangerButton}>Purge orphans</button></div>} />
@@ -1282,6 +1349,30 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   const runIds = [...new Set(allExceptions.map((exception) => exception.lastRunId).filter(Boolean))];
   const toggleSelection = (exceptionId: string, checked: boolean) => onSelectedIds(checked ? [...selectedIds, exceptionId] : selectedIds.filter((id) => id !== exceptionId));
   const visibleIds = exceptions.map((exception) => exception.id);
+  // Exceptions are summarised per rule first; the per-key detail is opt-in so a
+  // run with hundreds of findings stays readable.
+  const exceptionGroups = useMemo(() => {
+    const groups = new Map<string, { ruleId: string; name: string; items: StoredException[] }>();
+    for (const exception of exceptions) {
+      const existing = groups.get(exception.rule_id)
+        ?? { ruleId: exception.rule_id, name: rules.find((rule) => rule.id === exception.rule_id)?.name ?? 'Deleted rule', items: [] };
+      existing.items.push(exception);
+      groups.set(exception.rule_id, existing);
+    }
+    return [...groups.values()].map((group) => ({
+      ...group,
+      severityCounts: severities.map((severity) => ({ severity, count: group.items.filter((item) => item.severity === severity).length })).filter((entry) => entry.count > 0),
+      lastSeen: group.items.reduce<Date | null>((latest, item) => {
+        const seen = item.lastSeen ? new Date(item.lastSeen) : null;
+        return seen && (!latest || seen > latest) ? seen : latest;
+      }, null),
+    })).sort((a, b) => b.items.length - a.items.length);
+  }, [exceptions, rules]);
+  const [expandedRuleIds, setExpandedRuleIds] = useState<string[] | null>(null);
+  const defaultExpanded = exceptionGroups.length === 1 ? exceptionGroups.map((group) => group.ruleId) : [];
+  const expansion = expandedRuleIds ?? defaultExpanded;
+  const toggleGroup = (ruleId: string) => setExpandedRuleIds(expansion.includes(ruleId) ? expansion.filter((id) => id !== ruleId) : [...expansion, ruleId]);
+  const allExpanded = exceptionGroups.length > 0 && exceptionGroups.every((group) => expansion.includes(group.ruleId));
   const allowed: Record<StoredException['status'], StoredException['status'][]> = {
     open: ['acknowledged', 'investigating', 'resolved', 'accepted'],
     acknowledged: ['investigating', 'resolved', 'accepted', 'open'],
@@ -1292,14 +1383,43 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   return <div className="grid gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.8fr)]">
     <section className={card}>
       <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{runIds.map((runId) => { const run = runs.find((candidate) => candidate.id === runId); return <option key={runId} value={runId}>{run ? `${run.ruleName} · ${formatDate(run.startedAt)}` : `Deleted run · ${runId.slice(0, 8)}`}</option>; })}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500"><span>{exceptions.length} of {allExceptions.length} exceptions · {selectedIds.length} selected</span><div className="flex flex-wrap gap-2"><select className={input} value="" aria-label="Bulk status" onChange={(event) => { if (event.target.value) onBulkStatus(event.target.value as StoredException['status']); }} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'}><option value="">Bulk status...</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select><button type="button" onClick={onBulkAssign} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Assign selected</button><button type="button" onClick={onBulkComment} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Comment selected</button></div></div>
-      {exceptions.length ? <div className="max-h-[680px] overflow-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="sticky top-0 bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5"><input type="checkbox" aria-label="Select visible exceptions" checked={visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id))} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...visibleIds])] : selectedIds.filter((id) => !visibleIds.includes(id)))} /></th><th className="px-4 py-2.5">Business key</th><th className="px-4 py-2.5">Outcome</th><th className="px-4 py-2.5">Severity</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5">Last seen</th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{exceptions.map((exception) => <tr key={exception.id} className={selected?.id === exception.id ? 'bg-teal-50' : 'hover:bg-slate-50'}><td className="px-4 py-2.5"><input type="checkbox" aria-label={`Select exception ${exception.businessKey}`} checked={selectedIds.includes(exception.id)} onChange={(event) => toggleSelection(exception.id, event.target.checked)} /></td><td className="px-4 py-2.5"><button type="button" onClick={() => onSelect(exception)} className="text-left font-semibold text-teal-900 hover:underline">{exception.businessKey}</button></td><td className="px-4 py-2.5 text-slate-600">{humanOutcome(exception.outcome)}</td><td className="px-4 py-2.5"><SeverityPill value={exception.severity} /></td><td className="px-4 py-2.5"><StatusPill value={exception.status} /></td><td className="px-4 py-2.5 text-slate-600">{exception.owner || 'Unassigned'}</td><td className="px-4 py-2.5 text-xs text-slate-500">{formatDate(exception.lastSeen)}</td></tr>)}</tbody></table></div> : <EmptyMessage>No exceptions match this filter.</EmptyMessage>}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500">
+        <label className="flex items-center gap-2"><input type="checkbox" aria-label="Select visible exceptions" checked={visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id))} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...visibleIds])] : selectedIds.filter((id) => !visibleIds.includes(id)))} /><span>{exceptions.length} of {allExceptions.length} exceptions · {selectedIds.length} selected</span></label>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" onClick={() => setExpandedRuleIds(allExpanded ? [] : exceptionGroups.map((group) => group.ruleId))} disabled={!exceptionGroups.length} className={secondaryButton}>{allExpanded ? 'Collapse all' : 'Expand all'}</button>
+          <select className={input} value="" aria-label="Bulk status" onChange={(event) => { if (event.target.value) onBulkStatus(event.target.value as StoredException['status']); }} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'}><option value="">Bulk status...</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select>
+          <button type="button" onClick={onBulkAssign} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Assign selected</button>
+          <button type="button" onClick={onBulkComment} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Comment selected</button>
+        </div>
+      </div>
+      {exceptionGroups.length ? <div className="max-h-[680px] divide-y divide-slate-200 overflow-auto">
+        {exceptionGroups.map((group) => {
+          const groupIds = group.items.map((item) => item.id);
+          const groupSelected = groupIds.every((id) => selectedIds.includes(id));
+          const open = expansion.includes(group.ruleId);
+          return <div key={group.ruleId}>
+            <div className="flex flex-wrap items-center gap-3 bg-slate-50/80 px-4 py-2.5">
+              <input type="checkbox" aria-label={`Select all exceptions for ${group.name}`} checked={groupSelected} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...groupIds])] : selectedIds.filter((id) => !groupIds.includes(id)))} />
+              <button type="button" onClick={() => toggleGroup(group.ruleId)} aria-expanded={open} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                <span aria-hidden="true" className={`text-slate-400 transition-transform ${open ? 'rotate-90' : ''}`}>›</span>
+                <span className="truncate text-sm font-semibold text-slate-800">{group.name}</span>
+                <span className="shrink-0 text-xs text-slate-500">{group.items.length} exception{group.items.length === 1 ? '' : 's'}</span>
+              </button>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                {group.severityCounts.map((entry) => <span key={entry.severity} className="inline-flex items-center gap-1 text-xs tabular-nums text-slate-600"><SeverityPill value={entry.severity} />{entry.count}</span>)}
+                <span className="text-xs text-slate-500">last seen {formatDate(group.lastSeen ?? undefined)}</span>
+              </div>
+            </div>
+            {open && <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-white text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2"></th><th className="px-4 py-2">Business key</th><th className="px-4 py-2">Outcome</th><th className="px-4 py-2">Severity</th><th className="px-4 py-2">Status</th><th className="px-4 py-2">Owner</th><th className="px-4 py-2">Last seen</th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{group.items.map((exception) => <tr key={exception.id} className={selected?.id === exception.id ? 'bg-teal-50' : ''}><td className="px-4 py-2.5"><input type="checkbox" aria-label={`Select exception ${exception.businessKey}`} checked={selectedIds.includes(exception.id)} onChange={(event) => toggleSelection(exception.id, event.target.checked)} /></td><td className="px-4 py-2.5"><button type="button" onClick={() => onSelect(exception)} className="text-left font-semibold text-teal-900 hover:underline">{exception.businessKey}</button></td><td className="px-4 py-2.5 text-slate-600">{humanOutcome(exception.outcome)}</td><td className="px-4 py-2.5"><SeverityPill value={exception.severity} /></td><td className="px-4 py-2.5"><StatusPill value={exception.status} /></td><td className="px-4 py-2.5 text-slate-600">{exception.owner || 'Unassigned'}</td><td className="px-4 py-2.5 text-xs text-slate-500">{formatDate(exception.lastSeen)}</td></tr>)}</tbody></table></div>}
+          </div>;
+        })}
+      </div> : <EmptyMessage>No exceptions match this filter.</EmptyMessage>}
     </section>
     <section className={card}>
       <SectionTitle title={selected ? `Exception · ${selected.businessKey}` : 'Exception detail'} subtitle={selected ? `${humanOutcome(selected.outcome)} · ${selected.occurrenceCount} sighting${selected.occurrenceCount === 1 ? '' : 's'}` : 'Select a row to inspect and update its history.'} />
       {selected ? <div className="space-y-4 p-4">
         <div className="flex flex-wrap gap-2"><SeverityPill value={selected.severity} /><StatusPill value={selected.status} /><span className="text-xs text-slate-500">First seen {formatDate(selected.firstSeen)}</span></div>
-        <ExceptionValues exception={selected} />
+        <ExceptionValues exception={selected} rule={rules.find((rule) => rule.id === selected.rule_id)} />
         <div><label className={labelClass}>Assigned owner</label><div className="flex gap-2"><input className={input} value={owner} onChange={(event) => onOwner(event.target.value)} placeholder="name@company.com" /><button type="button" onClick={onAssign} disabled={busyKey.startsWith('exception:')} className={secondaryButton}>Save</button></div></div>
         <div><label className={labelClass}>Move to status</label><select className={input} value="" onChange={(event) => { if (event.target.value) onStatus(event.target.value as StoredException['status']); }} disabled={busyKey.startsWith('exception:')}><option value="">Choose transition...</option>{allowed[selected.status].map((status) => <option key={status} value={status}>{status}</option>)}</select></div>
         <div><label className={labelClass}>Closure reason</label><input className={input} value={reason} onChange={(event) => onReason(event.target.value)} placeholder="Required when resolving or accepting" /></div>
@@ -1310,20 +1430,77 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   </div>;
 }
 
-function RunsPanel({ runs, selectedRun, findings, busyKey, onDetails, onCompare, onDelete }: { runs: StoredRun[]; selectedRun: StoredRun | null; findings: ReconciliationFinding[]; busyKey: string; onDetails: (run: StoredRun) => void; onCompare: (run: StoredRun) => void; onDelete: (run: StoredRun) => void }) {
+function RunsPanel({ runs, busyKey, onCompare, onDelete }: { runs: StoredRun[]; busyKey: string; onCompare: (run: StoredRun) => void; onDelete: (run: StoredRun) => void }) {
   return <section className={card}><SectionTitle title="Run history" subtitle="Every run retains the rule version, counts, and per-item findings." />
-    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{runs.map((run) => <tr key={run.id} className={selectedRun?.id === run.id ? 'bg-teal-50' : ''}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3"><button type="button" onClick={() => onDetails(run)} className="text-xs font-semibold text-slate-700 hover:underline">Details</button>{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Compare</button>}<button type="button" onClick={() => onDelete(run)} disabled={run.status === 'running' || busyKey === `delete-run:${run.id}`} className="text-xs font-semibold text-rose-700 hover:underline disabled:opacity-40">Delete</button></div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
-    {selectedRun && <div className="border-t border-slate-200"><SectionTitle title={`Run findings · ${selectedRun.ruleName}`} subtitle={`Version ${selectedRun.ruleVersion} · ${findings.length} findings stored`} />{findings.length ? <div className="divide-y divide-slate-100">{findings.slice(0, 500).map((finding) => <div key={finding.fingerprint} className="flex flex-wrap items-start justify-between gap-3 px-4 py-3"><div><p className="text-sm font-semibold">{finding.businessKey}</p><p className="mt-1 text-xs text-slate-500">{humanOutcome(finding.outcome)}{finding.differences.length ? ` · ${finding.differences.map((difference) => difference.field).join(', ')}` : ''}</p></div><SeverityPill value={finding.severity} /></div>)}</div> : selectedRun.exceptionCount > 0 ? <EmptyMessage>This run has totals but no detailed findings.</EmptyMessage> : <EmptyMessage>This run completed with no findings.</EmptyMessage>}</div>}
+    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{runs.map((run) => <tr key={run.id}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3">{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Compare</button>}<button type="button" onClick={() => onDelete(run)} disabled={run.status === 'running' || busyKey === `delete-run:${run.id}`} className="text-xs font-semibold text-rose-700 hover:underline disabled:opacity-40">Delete</button></div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
   </section>;
 }
 
-function ExceptionValues({ exception }: { exception: StoredException }) {
+export function PromptDialog({ request, onResolve }: { request: DialogRequest; onResolve: (value: string | null) => void }) {
+  const [value, setValue] = useState(request.defaultValue ?? '');
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { inputRef.current?.focus(); inputRef.current?.select(); }, []);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onResolve(null); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onResolve]);
+  const blocked = request.kind === 'prompt' && request.requireValue === true && !value.trim();
+  const confirm = () => { if (!blocked) onResolve(request.kind === 'prompt' ? value : ''); };
+  return (
+    <div role="dialog" aria-modal="true" aria-label={request.title} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-3">
+          <h2 className="text-sm font-semibold text-slate-900">{request.title}</h2>
+          <button type="button" aria-label="Close" onClick={() => onResolve(null)} className="text-lg leading-none text-slate-400 transition hover:text-slate-700">×</button>
+        </div>
+        <form
+          className="space-y-3 px-5 py-4"
+          onSubmit={(event) => { event.preventDefault(); confirm(); }}
+        >
+          {request.message && <p className="text-sm text-slate-600">{request.message}</p>}
+          {request.kind === 'prompt' && <div>
+            {request.label && <label className={labelClass} htmlFor="dialog-input">{request.label}</label>}
+            <input id="dialog-input" ref={inputRef} className={input} value={value} placeholder={request.placeholder} onChange={(event) => setValue(event.target.value)} />
+          </div>}
+          <div className="flex justify-end gap-2 pt-1">
+            <button type="button" onClick={() => onResolve(null)} className={secondaryButton}>Cancel</button>
+            <button type="submit" disabled={blocked} className={request.tone === 'danger' ? dangerButton : primaryButton}>{request.confirmLabel ?? 'Confirm'}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function ExceptionValues({ exception, rule }: { exception: StoredException; rule?: StoredRule }) {
   const detail = parseExceptionDetail(exception);
-  if (!detail.differences?.length && !detail.valuesA && !detail.valuesB) return null;
+  const { rows, recordNote } = buildComparisonRows(detail);
+  if (!rows.length && !recordNote) return null;
   const display = (value: unknown) => value === null || value === undefined ? '—' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+  const headerA = rule?.datasetA ? `Source A · ${rule.datasetA}` : 'Source A';
+  const headerB = rule?.datasetB ? `Source B · ${rule.datasetB}` : 'Source B';
+  const keyFields = rule?.keyFieldA && rule.keyFieldB
+    ? rule.keyFieldA === rule.keyFieldB ? rule.keyFieldA : `${rule.keyFieldA} ↔ ${rule.keyFieldB}`
+    : null;
   return <div className="overflow-hidden rounded-lg border border-slate-200">
     <div className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase text-slate-600">Compared values</div>
-    {detail.differences?.length ? <div className="overflow-x-auto"><table className="w-full min-w-[420px] text-left text-xs"><thead className="text-slate-500"><tr><th className="px-3 py-2 font-medium">Field</th><th className="px-3 py-2 font-medium">Left</th><th className="px-3 py-2 font-medium">Right</th><th className="px-3 py-2 font-medium">Difference</th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">{detail.differences.map((difference, index) => <tr key={`${difference.field}-${index}`}><td className="px-3 py-2 font-medium">{difference.field}</td><td className="max-w-40 break-words px-3 py-2">{display(difference.valueA)}</td><td className="max-w-40 break-words px-3 py-2">{display(difference.valueB)}</td><td className="px-3 py-2">{difference.difference ?? difference.reason ?? 'Different'}</td></tr>)}</tbody></table></div> : <div className="grid gap-3 p-3 sm:grid-cols-2"><div><p className={labelClass}>Left</p><pre className="whitespace-pre-wrap break-words text-xs">{JSON.stringify(detail.valuesA, null, 2)}</pre></div><div><p className={labelClass}>Right</p><pre className="whitespace-pre-wrap break-words text-xs">{JSON.stringify(detail.valuesB, null, 2)}</pre></div></div>}
+    <dl className="grid gap-x-6 gap-y-1 border-b border-slate-200 bg-white px-3 py-2 text-xs sm:grid-cols-2">
+      <div className="flex gap-2"><dt className="font-semibold text-slate-500">Business key</dt><dd className="break-words font-mono text-slate-800">{exception.businessKey}</dd></div>
+      {keyFields && <div className="flex gap-2"><dt className="font-semibold text-slate-500">Matched on</dt><dd className="break-words font-mono text-slate-800">{keyFields}</dd></div>}
+    </dl>
+    {recordNote && <p className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">{recordNote}</p>}
+    {rows.length ? <div className="overflow-x-auto"><table className="w-full min-w-[480px] text-left text-xs">
+      <thead className="text-slate-500"><tr><th className="px-3 py-2 font-medium">Field</th><th className="px-3 py-2 font-medium">{headerA}</th><th className="px-3 py-2 font-medium">{headerB}</th><th className="px-3 py-2 font-medium">Difference</th></tr></thead>
+      <tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
+        {rows.map((row) => <tr key={row.field}>
+          <td className="px-3 py-2 font-medium">{row.field}</td>
+          <td className="max-w-40 break-words px-3 py-2">{row.presentA ? display(row.valueA) : <span className="italic text-slate-400">Not present</span>}</td>
+          <td className="max-w-40 break-words px-3 py-2">{row.presentB ? display(row.valueB) : <span className="italic text-slate-400">Not present</span>}</td>
+          <td className="px-3 py-2">{row.note ?? '—'}</td>
+        </tr>)}
+      </tbody>
+    </table></div> : null}
   </div>;
 }
 
