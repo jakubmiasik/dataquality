@@ -114,15 +114,69 @@ function sqlConfig(source: ResolvedFabricSource, accessToken: string): sql.confi
       trustServerCertificate: false,
       enableArithAbort: true,
     },
-    connectionTimeout: 15000,
-    requestTimeout: 120000,
+    connectionTimeout: connectTimeoutMs(),
+    requestTimeout: requestTimeoutMs(),
   };
 }
 
+function positiveIntSetting(name: string, fallback: number) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * A Fabric SQL endpoint sits on a capacity that resumes on demand, so the very
+ * first connection after an idle period routinely takes far longer than a warm
+ * one. The old 15s budget turned that normal warm-up into a hard failure.
+ */
+const connectTimeoutMs = () => positiveIntSetting('SQL_CONNECT_TIMEOUT_MS', 45000);
+const requestTimeoutMs = () => positiveIntSetting('SQL_REQUEST_TIMEOUT_MS', 120000);
+const connectAttempts = () => positiveIntSetting('SQL_CONNECT_ATTEMPTS', 3);
+
+const transientConnect = /failed to connect|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ESOCKET|connection is closed/i;
+
+export function isTransientConnectError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const code = (error as { code?: string } | null)?.code ?? '';
+  return transientConnect.test(message) || transientConnect.test(code);
+}
+
+/**
+ * Rewrites tedious' opaque timeout into something a reader can act on. A
+ * connect timeout is a network/capacity symptom, so it must not be mistaken
+ * for the workspace permissions it superficially resembles.
+ */
+export function describeConnectFailure(source: ResolvedFabricSource, error: unknown, attempts: number): Error {
+  if (!isTransientConnectError(error)) return error instanceof Error ? error : new Error(String(error));
+  const seconds = Math.round(connectTimeoutMs() / 1000);
+  return new Error(
+    `Could not reach the SQL endpoint for "${source.database}" (${source.connectionString}:1433) after ${attempts} attempt(s), each allowed ${seconds}s. `
+    + 'This is a connectivity or capacity problem rather than a permissions one: the request never got far enough to be authorized. '
+    + 'Check that the Fabric capacity hosting this item is running and not paused, then retry.'
+  );
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function connectWithRetry(source: ResolvedFabricSource, accessToken: string): Promise<sql.ConnectionPool> {
+  const attempts = connectAttempts();
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await new sql.ConnectionPool(sqlConfig(source, accessToken)).connect();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectError(error) || attempt === attempts) break;
+      await delay(attempt * 1000);
+    }
+  }
+  throw describeConnectFailure(source, lastError, attempts);
+}
+
 async function withSqlPool<T>(source: ResolvedFabricSource, accessToken: string, action: (pool: sql.ConnectionPool) => Promise<T>): Promise<T> {
-  const pool = await new sql.ConnectionPool(sqlConfig(source, accessToken)).connect();
+  const pool = await connectWithRetry(source, accessToken);
   try { return await action(pool); }
-  finally { await pool.close(); }
+  finally { await pool.close().catch(() => undefined); }
 }
 
 export async function readSourceCatalog(source: FabricSourceReference, bearerToken: string, sqlAccessToken: string) {

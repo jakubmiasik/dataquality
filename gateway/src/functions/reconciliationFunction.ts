@@ -20,6 +20,7 @@ function statusFor(error: unknown) {
   if (message.includes('same signed-in user')) return 401;
   if (message.includes('denied access')) return 403;
   if (message.includes('not configured')) return 503;
+  if (message.includes('Could not reach the SQL endpoint')) return 504;
   if (message.includes('could not resolve') || message.includes('did not return')) return 404;
   return 502;
 }
