@@ -237,3 +237,6 @@ output AZURE_LOCATION string = location
 output AZURE_TENANT_ID string = tenant().tenantId
 output SERVICE_API_NAME string = api.outputs.SERVICE_API_NAME
 output AZURE_FUNCTION_NAME string = api.outputs.SERVICE_API_NAME
+
+@description('Origin of the deployed gateway. Paste this into the "Reconciliation gateway URL" field on the app\'s Configuration tab.')
+output RECONCILIATION_GATEWAY_URL string = api.outputs.SERVICE_API_URI

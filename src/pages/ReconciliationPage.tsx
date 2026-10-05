@@ -755,7 +755,7 @@ export function ReconciliationPage() {
             <button type="button" onClick={() => void signOut()} className={secondaryButton}>Sign out</button>
           </div>
         </div>
-        <nav className="mx-auto flex max-w-[1440px] gap-1 overflow-x-auto px-4 pb-2 sm:px-7" aria-label="Reconciliation sections">
+        <nav className="mx-auto flex max-w-[1440px] gap-1 overflow-x-auto px-4 pb-3 pt-2 sm:px-7" aria-label="Reconciliation sections">
           {tabs.map((entry) => (
             <button key={entry.id} type="button" onClick={() => { setTab(entry.id); setError(null); }}
               aria-current={tab === entry.id ? 'page' : undefined}

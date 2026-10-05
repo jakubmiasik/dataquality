@@ -2,14 +2,14 @@
   "name": "functions-quickstart-typescript-azd",
   "version": "1.0.0",
   "description": "",
-  "main": "dist/gateway/src/{index.js,functions/*.js}",
+  "main": "dist/src/{index.js,functions/*.js}",
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
     "clean": "rimraf dist",
     "prestart": "npm run clean && npm run build",
     "start": "func start",
-    "test": "npm run build && node --test dist/gateway/src/reconciliation.test.js"
+    "test": "npm run build && node --test dist/src/reconciliation.test.js"
   },
   "dependencies": {
     "@azure/functions": "^4.11.0",
