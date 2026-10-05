@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "12653183166284260331"
+      "templateHash": "10819739439524685660"
     }
   },
   "parameters": {
@@ -101,6 +101,13 @@
       "defaultValue": "[deployer().objectId]",
       "metadata": {
         "description": "Id of the user identity to be used for testing and debugging. This is not required in production. Leave empty if not needed."
+      }
+    },
+    "corsAllowedOrigins": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Comma-separated browser origins allowed to call the gateway. The Fabric-hosted app runs cross-origin, so set this to the app origin (for example https://app.fabric.microsoft.com) before deploying."
       }
     }
   },
@@ -240,6 +247,7 @@
       "webSitesFunctions": "func-",
       "webStaticSites": "stapp-"
     },
+    "corsOrigins": "[if(empty(trim(parameters('corsAllowedOrigins'))), createArray(), filter(map(split(parameters('corsAllowedOrigins'), ','), lambda('origin', trim(lambdaVariables('origin')))), lambda('origin', not(empty(lambdaVariables('origin'))))))]",
     "abbrs": "[variables('$fxv#0')]",
     "resourceToken": "[toLower(uniqueString(subscription().id, parameters('environmentName'), parameters('location')))]",
     "tags": {
@@ -1309,6 +1317,9 @@
           "appSettings": {
             "value": {}
           },
+          "corsAllowedOrigins": {
+            "value": "[variables('corsOrigins')]"
+          },
           "virtualNetworkSubnetId": "[if(parameters('vnetEnabled'), createObject('value', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, if(not(empty(parameters('resourceGroupName'))), parameters('resourceGroupName'), format('{0}{1}', variables('abbrs').resourcesResourceGroups, parameters('environmentName')))), 'Microsoft.Resources/deployments', 'serviceVirtualNetwork'), '2025-04-01').outputs.appSubnetID.value), createObject('value', ''))]"
         },
         "template": {
@@ -1318,7 +1329,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "17778148564873213584"
+              "templateHash": "2338344382985942048"
             }
           },
           "parameters": {
@@ -1406,6 +1417,13 @@
                 "SystemAssigned",
                 "UserAssigned"
               ]
+            },
+            "corsAllowedOrigins": {
+              "type": "array",
+              "defaultValue": [],
+              "metadata": {
+                "description": "Origins allowed to call the gateway from a browser. The Fabric-hosted app is cross-origin, so its origin must be listed here."
+              }
             }
           },
           "variables": {
@@ -1470,7 +1488,11 @@
                   },
                   "siteConfig": {
                     "value": {
-                      "alwaysOn": false
+                      "alwaysOn": false,
+                      "cors": {
+                        "allowedOrigins": "[parameters('corsAllowedOrigins')]",
+                        "supportCredentials": false
+                      }
                     }
                   },
                   "virtualNetworkSubnetId": "[if(not(empty(parameters('virtualNetworkSubnetId'))), createObject('value', parameters('virtualNetworkSubnetId')), createObject('value', null()))]",

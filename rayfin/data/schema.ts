@@ -6,6 +6,7 @@ import { ReconciliationRuleField } from './ReconciliationRuleField.js';
 import { ReconciliationRuleVersion } from './ReconciliationRuleVersion.js';
 import { ReconciliationRuleVersionField } from './ReconciliationRuleVersionField.js';
 import { ReconciliationRun } from './ReconciliationRun.js';
+import { ReconciliationSchedule } from './ReconciliationSchedule.js';
 import { ReconciliationSource } from './ReconciliationSource.js';
 
 export type ReconciliationAppSchema = {
@@ -18,6 +19,7 @@ export type ReconciliationAppSchema = {
 	ReconciliationFinding: ReconciliationFinding;
 	ReconciliationException: ReconciliationException;
 	ReconciliationExceptionEvent: ReconciliationExceptionEvent;
+	ReconciliationSchedule: ReconciliationSchedule;
 };
 
 export type BlankAppSchema = ReconciliationAppSchema;
@@ -32,4 +34,5 @@ export const schema = [
 	ReconciliationFinding,
 	ReconciliationException,
 	ReconciliationExceptionEvent,
+	ReconciliationSchedule,
 ];

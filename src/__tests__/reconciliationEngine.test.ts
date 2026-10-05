@@ -38,7 +38,7 @@ describe('reconciliation engine', () => {
         { alias: 'recon_key', kind: 'field', value: 'Account' },
         { alias: 'recon_c0a', kind: 'aggregate', fn: 'sum', valueKind: 'field', value: 'Amount' },
       ],
-    })).toBe('SELECT TOP (200000) [Account] AS [recon_key], SUM([Amount]) AS [recon_c0a] FROM [dbo].[Postings] GROUP BY [Account]');
+    })).toBe('SELECT TOP (10000) [Account] AS [recon_key], SUM([Amount]) AS [recon_c0a] FROM [dbo].[Postings] GROUP BY [Account]');
     expect(() => buildSelectSql({ dataset: 'dbo.Users; DROP TABLE X', selections: [{ alias: 'k', kind: 'field', value: 'id' }] })).toThrow();
   });
 

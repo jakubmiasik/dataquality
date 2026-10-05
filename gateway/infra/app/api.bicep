@@ -23,6 +23,9 @@ param enableFile bool = false
 @allowed(['SystemAssigned', 'UserAssigned'])
 param identityType string = 'UserAssigned'
 
+@description('Origins allowed to call the gateway from a browser. The Fabric-hosted app is cross-origin, so its origin must be listed here.')
+param corsAllowedOrigins array = []
+
 var applicationInsightsIdentity = 'ClientId=${identityClientId};Authorization=AAD'
 var kind = 'functionapp,linux'
 
@@ -98,6 +101,11 @@ module api 'br/public:avm/res/web/site:0.15.1' = {
     }
     siteConfig: {
       alwaysOn: false
+      cors: {
+        allowedOrigins: corsAllowedOrigins
+        // The browser sends delegated tokens in explicit headers, never cookies.
+        supportCredentials: false
+      }
     }
     virtualNetworkSubnetId: !empty(virtualNetworkSubnetId) ? virtualNetworkSubnetId : null
     appSettingsKeyValuePairs: allAppSettings

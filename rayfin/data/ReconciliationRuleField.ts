@@ -1,7 +1,7 @@
-import { authenticated, decimal, entity, int, set, text, uuid } from '@microsoft/rayfin-core';
+import { authenticated, boolean, decimal, entity, int, set, text, uuid } from '@microsoft/rayfin-core';
 
 @entity()
-@authenticated('*', { policy: (claims, item) => claims.sub.eq(item.user_id) })
+@authenticated('*')
 export class ReconciliationRuleField {
   @uuid() id!: string;
   @text({ max: 64 }) rule_id!: string;
@@ -18,5 +18,7 @@ export class ReconciliationRuleField {
   @text({ max: 20, optional: true }) bValueKind?: string;
   @set('absolute', 'percent', 'days', 'none') toleranceType!: 'absolute' | 'percent' | 'days' | 'none';
   @decimal({ optional: true }) toleranceValue?: number;
+  @boolean() caseInsensitive!: boolean;
+  @boolean() trimValues!: boolean;
   @text({ max: 255 }) user_id!: string;
 }

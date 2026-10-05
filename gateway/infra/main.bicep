@@ -59,6 +59,11 @@ param vNetName string = ''
 @description('Id of the user identity to be used for testing and debugging. This is not required in production. Leave empty if not needed.')
 param principalId string = deployer().objectId
 
+@description('Comma-separated browser origins allowed to call the gateway. The Fabric-hosted app runs cross-origin, so set this to the app origin (for example https://app.fabric.microsoft.com) before deploying.')
+param corsAllowedOrigins string = ''
+
+var corsOrigins = empty(trim(corsAllowedOrigins)) ? [] : filter(map(split(corsAllowedOrigins, ','), origin => trim(origin)), origin => !empty(origin))
+
 var abbrs = loadJsonContent('./abbreviations.json')
 var resourceToken = toLower(uniqueString(subscription().id, environmentName, location))
 var tags = { 'azd-env-name': environmentName }
@@ -120,6 +125,7 @@ module api './app/api.bicep' = {
     identityClientId: apiUserAssignedIdentity.outputs.clientId
     appSettings: {
     }
+    corsAllowedOrigins: corsOrigins
     virtualNetworkSubnetId: vnetEnabled ? serviceVirtualNetwork.outputs.appSubnetID : ''
   }
 }

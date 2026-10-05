@@ -1,7 +1,7 @@
 import { authenticated, boolean, date, int, set, text, uuid, entity } from '@microsoft/rayfin-core';
 
 @entity()
-@authenticated('*', { policy: (claims, item) => claims.sub.eq(item.user_id) })
+@authenticated('*')
 export class ReconciliationRule {
   @uuid() id!: string;
   @text({ max: 255 }) name!: string;

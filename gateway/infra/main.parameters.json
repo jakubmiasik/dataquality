@@ -13,6 +13,9 @@
     },
     "vnetEnabled": {
       "value": "${VNET_ENABLED}"
+    },
+    "corsAllowedOrigins": {
+      "value": "${CORS_ALLOWED_ORIGINS}"
     }
   }
 }

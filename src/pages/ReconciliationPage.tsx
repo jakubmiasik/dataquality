@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { useAuth } from '@/hooks/AuthContext';
+import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
 import {
   callReconciliationGateway,
   listWorkspaceResources,
@@ -11,18 +12,27 @@ import {
 import {
   addExceptionComment,
   assignException,
+  bulkSetRuleStatus,
+  bulkUpdateExceptions,
   compareRuns as compareStoredRuns,
   completeRun,
   createRun,
+  deleteRun,
+  deleteSchedule,
   failRun,
+  findOrphans,
   loadExceptionEvents,
   loadRunFindings,
   loadReconciliationData,
   loadRuleFields,
   loadRuleVersions,
+  purgeOrphans,
+  retireRule,
   saveReconciliationSource,
   saveRule,
+  saveSchedule,
   setRuleEnabled,
+  setScheduleEnabled,
   updateExceptionStatus,
   type RuleDraft,
   type StoredException,
@@ -30,26 +40,26 @@ import {
   type StoredRun,
 } from '@/services/reconciliationRepository';
 import type { CompareField, Operand, ReconciliationFinding, ReconciliationResult } from '@/services/reconciliationEngine';
+import { summariseSweep } from '@/services/reconciliationScheduler';
+import { describeSchedule, nextOccurrence, validateSchedule, type ScheduleDefinition } from '@/services/reconciliationSchedule';
 
-type Tab = 'overview' | 'sources' | 'rules' | 'exceptions' | 'runs' | 'compare';
+type Tab = 'overview' | 'sources' | 'rules' | 'schedules' | 'exceptions' | 'runs' | 'compare';
 type AppData = Awaited<ReturnType<typeof loadReconciliationData>>;
+type ComparisonResult = Awaited<ReturnType<typeof compareStoredRuns>>;
+type OrphanReport = Awaited<ReturnType<typeof findOrphans>>;
+type ExceptionFilter = { status: string; severity: string; outcome: string; ruleId: string; ruleGroup: string; runId: string; owner: string };
+type ScheduleDraft = ScheduleDefinition & { id?: string; ruleId: string; enabled: boolean };
 
 interface CatalogResponse {
   source: { sqlEndpoint: string; database: string };
   objects: SqlObject[];
 }
 
-interface ComparisonResult {
-  newlyFailing: ReconciliationFinding[];
-  fixed: ReconciliationFinding[];
-  stillFailing: ReconciliationFinding[];
-  metrics: { recordsA: number; recordsB: number; matched: number; exceptionCount: number };
-}
-
 const tabs: Array<{ id: Tab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'sources', label: 'Sources' },
   { id: 'rules', label: 'Rules' },
+  { id: 'schedules', label: 'Schedules' },
   { id: 'exceptions', label: 'Exceptions' },
   { id: 'runs', label: 'Runs' },
   { id: 'compare', label: 'Compare runs' },
@@ -76,7 +86,7 @@ function blankOperand(): Operand {
 }
 
 function blankField(index: number): CompareField {
-  return { label: `Value ${index + 1}`, type: 'string', a: blankOperand(), b: blankOperand() };
+  return { label: `Value ${index + 1}`, type: 'string', a: blankOperand(), b: blankOperand(), caseInsensitive: false, trim: true };
 }
 
 function blankRule(): RuleDraft {
@@ -133,11 +143,15 @@ export function ReconciliationPage() {
   const [exceptionEvents, setExceptionEvents] = useState<Array<Record<string, unknown>>>([]);
   const [versionHistory, setVersionHistory] = useState<Array<Record<string, unknown>> | null>(null);
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft | null>(null);
+  const [orphanReport, setOrphanReport] = useState<OrphanReport | null>(null);
+  const [selectedRuleIds, setSelectedRuleIds] = useState<string[]>([]);
+  const [selectedExceptionIds, setSelectedExceptionIds] = useState<string[]>([]);
   const [comparisonRuleId, setComparisonRuleId] = useState('');
   const [fromRunId, setFromRunId] = useState('');
   const [toRunId, setToRunId] = useState('');
   const [registrationFilter, setRegistrationFilter] = useState('');
-  const [exceptionFilter, setExceptionFilter] = useState<{ status: string; severity: string; outcome: string }>({ status: 'open', severity: '', outcome: '' });
+  const [exceptionFilter, setExceptionFilter] = useState<ExceptionFilter>({ status: 'open', severity: '', outcome: '', ruleId: '', ruleGroup: '', runId: '', owner: '' });
   const [ownerInput, setOwnerInput] = useState('');
   const [commentInput, setCommentInput] = useState('');
   const [closeReason, setCloseReason] = useState('');
@@ -186,13 +200,30 @@ export function ReconciliationPage() {
   const rules = useMemo(() => data?.rules ?? [], [data]);
   const runs = useMemo(() => data?.runs ?? [], [data]);
   const exceptions = useMemo(() => data?.exceptions ?? [], [data]);
+  const schedules = useMemo(() => data?.schedules ?? [], [data]);
   const openExceptions = exceptions.filter((exception) => exception.status === 'open' || exception.status === 'acknowledged' || exception.status === 'investigating');
 
-  const filteredExceptions = useMemo(() => exceptions.filter((exception) =>
-    (!exceptionFilter.status || exception.status === exceptionFilter.status)
-    && (!exceptionFilter.severity || exception.severity === exceptionFilter.severity)
-    && (!exceptionFilter.outcome || exception.outcome === exceptionFilter.outcome)
-  ), [exceptions, exceptionFilter]);
+  useScheduleSweeper({
+    enabled: Boolean(userId && data),
+    rules,
+    execute: executeRule,
+    onSwept: (executions) => {
+      const summary = summariseSweep(executions);
+      if (summary) setNotice(summary);
+      void refreshData();
+    },
+  });
+
+  const filteredExceptions = useMemo(() => exceptions.filter((exception) => {
+    const rule = rules.find((entry) => entry.id === exception.rule_id);
+    return (!exceptionFilter.status || exception.status === exceptionFilter.status)
+      && (!exceptionFilter.severity || exception.severity === exceptionFilter.severity)
+      && (!exceptionFilter.outcome || exception.outcome === exceptionFilter.outcome)
+      && (!exceptionFilter.ruleId || exception.rule_id === exceptionFilter.ruleId)
+      && (!exceptionFilter.ruleGroup || rule?.ruleGroup === exceptionFilter.ruleGroup)
+      && (!exceptionFilter.runId || exception.lastRunId === exceptionFilter.runId)
+      && (!exceptionFilter.owner || (exception.owner ?? '').toLocaleLowerCase().includes(exceptionFilter.owner.toLocaleLowerCase()));
+  }), [exceptions, exceptionFilter, rules]);
 
   const selectedComparisonRuns = useMemo(() => runs.filter((run) =>
     run.rule_id === comparisonRuleId && run.status === 'completed'
@@ -364,33 +395,90 @@ export function ReconciliationPage() {
     finally { setBusyKey(''); }
   }
 
-  async function runRule(rule: StoredRule) {
-    if (!user) return;
+  async function executeRule(rule: StoredRule): Promise<{ ok: true; runId: string; matched: number; findings: number } | { ok: false; message: string }> {
+    if (!user) return { ok: false, message: 'Sign in before running rules.' };
     const sourceA = sources.find((source) => source.id === rule.sourceAId);
     const sourceB = sources.find((source) => source.id === rule.sourceBId);
-    if (!sourceA || !sourceB) { setError('The rule is missing one of its saved sources.'); return; }
+    if (!sourceA || !sourceB) return { ok: false, message: 'The rule is missing one of its saved sources.' };
+    if (!rule.enabled || rule.status === 'retired') return { ok: false, message: `${rule.name} is not enabled for runs.` };
+    const compareFields = await loadRuleFields(rule.id, user.id);
+    const run = await createRun(rule, user.id, user.name);
+    try {
+      const execution = await callReconciliationGateway<{ result: ReconciliationResult }>('execute', user.email, {
+        sources: {
+          a: { workspaceId: sourceA.workspaceId, itemId: sourceA.itemId, itemType: sourceA.itemType },
+          b: { workspaceId: sourceB.workspaceId, itemId: sourceB.itemId, itemType: sourceB.itemType },
+        },
+        rule: { ...rule, compareFields, rowLimit: Math.min(rule.rowLimit || 10000, 10000) },
+      });
+      await completeRun(run.id, rule, execution.result, user.id);
+      return { ok: true, runId: run.id, matched: execution.result.summary.matched, findings: execution.result.summary.exceptions };
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'Reconciliation failed.';
+      try { await failRun(run.id, message); } catch { /* Keep reporting the original execution failure. */ }
+      return { ok: false, message };
+    }
+  }
+
+  async function runRule(rule: StoredRule) {
+    if (!user) return;
     setBusyKey(`run:${rule.id}`);
     setError(null);
     try {
-      const compareFields = await loadRuleFields(rule.id, user.id);
-      const run = await createRun(rule, user.id, user.name);
-      try {
-        const execution = await callReconciliationGateway<{ result: ReconciliationResult }>('execute', user.email, {
-          sources: {
-            a: { workspaceId: sourceA.workspaceId, itemId: sourceA.itemId, itemType: sourceA.itemType },
-            b: { workspaceId: sourceB.workspaceId, itemId: sourceB.itemId, itemType: sourceB.itemType },
-          },
-          rule: { ...rule, compareFields, rowLimit: Math.min(rule.rowLimit || 10000, 10000) },
-        });
-        await completeRun(run.id, rule, execution.result, user.id);
-        setNotice(`Run completed: ${execution.result.summary.matched} matched, ${execution.result.summary.exceptions} findings.`);
-      } catch (reason) {
-        await failRun(run.id, reason instanceof Error ? reason.message : 'Reconciliation failed.');
-        throw reason;
-      }
+      const result = await executeRule(rule);
+      if (!result.ok) throw new Error(result.message);
+      setNotice(`Run completed: ${result.matched} matched, ${result.findings} findings.`);
       await refreshData();
       setTab('runs');
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to run this rule.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function runSelectedRules() {
+    if (!user) return;
+    const selected = rules.filter((rule) => selectedRuleIds.includes(rule.id) && rule.enabled && rule.status !== 'retired');
+    if (!selected.length) { setError('Select at least one enabled, active rule to run.'); return; }
+    setBusyKey('run-selected');
+    setError(null);
+    let failed = 0;
+    try {
+      for (const rule of selected) {
+        const result = await executeRule(rule);
+        if (!result.ok) failed += 1;
+      }
+      setNotice(`${selected.length} rule${selected.length === 1 ? '' : 's'} run, ${failed} failed.`);
+      await refreshData();
+      setTab('runs');
+    } finally { setBusyKey(''); }
+  }
+
+  async function bulkChangeRuleStatus(enabled: boolean) {
+    if (!user) return;
+    const selected = rules.filter((rule) => selectedRuleIds.includes(rule.id) && rule.status !== 'retired');
+    if (!selected.length) { setError('Select at least one non-retired rule.'); return; }
+    setBusyKey(`bulk-rules:${enabled ? 'enable' : 'disable'}`);
+    setError(null);
+    try {
+      const result = await bulkSetRuleStatus(selected, enabled, user.id, user.name);
+      if (result.succeeded.length) setNotice(`${result.succeeded.length} rule${result.succeeded.length === 1 ? '' : 's'} ${enabled ? 'enabled' : 'disabled'}.`);
+      if (result.failed.length) setError(result.failed.map((failure) => `${failure.ruleName}: ${failure.message}`).join(' '));
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to update selected rules.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function retireSelectedRule(rule: StoredRule) {
+    if (!user) return;
+    if (!window.confirm(`Retire "${rule.name}"? Retired rules cannot be run or re-enabled from this page.`)) return;
+    const reason = window.prompt('Optional retirement reason', 'Rule retired from the reconciliation workspace') ?? undefined;
+    setBusyKey(`retire:${rule.id}`);
+    setError(null);
+    try {
+      const fields = await loadRuleFields(rule.id, user.id);
+      await retireRule(rule, fields, user.id, user.name, reason);
+      setNotice(`${rule.name} retired.`);
+      await refreshData();
+    } catch (reasonValue) { setError(reasonValue instanceof Error ? reasonValue.message : 'Unable to retire this rule.'); }
     finally { setBusyKey(''); }
   }
 
@@ -403,6 +491,141 @@ export function ReconciliationPage() {
     setError(null);
     try { setComparison(await compareStoredRuns(from, to, user.id)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to compare these runs.'); }
+    finally { setBusyKey(''); }
+  }
+
+  function openNewSchedule() {
+    const rule = rules.find((entry) => entry.status === 'active') ?? rules.find((entry) => entry.status !== 'retired');
+    setScheduleDraft({ ruleId: rule?.id ?? '', enabled: true, cadence: 'hourly', intervalCount: 1, hourUtc: 0, minuteUtc: 0 });
+    setError(null);
+  }
+
+  function openEditSchedule(schedule: AppData['schedules'][number]) {
+    setScheduleDraft({
+      id: schedule.id,
+      ruleId: schedule.rule_id,
+      enabled: schedule.enabled,
+      cadence: schedule.cadence,
+      intervalCount: schedule.intervalCount,
+      hourUtc: schedule.hourUtc,
+      minuteUtc: schedule.minuteUtc,
+      dayOfWeek: schedule.dayOfWeek,
+    });
+    setError(null);
+  }
+
+  async function saveCurrentSchedule() {
+    if (!user || !scheduleDraft) return;
+    const rule = rules.find((entry) => entry.id === scheduleDraft.ruleId);
+    if (!rule) { setError('Choose a rule for this schedule.'); return; }
+    const problems = validateSchedule(scheduleDraft);
+    if (problems.length) { setError(problems.join(' ')); return; }
+    setBusyKey('save-schedule');
+    setError(null);
+    try {
+      await saveSchedule(rule, scheduleDraft, user.id, user.name);
+      setScheduleDraft(null);
+      setNotice(`Schedule ${scheduleDraft.id ? 'updated' : 'created'} for ${rule.name}.`);
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to save this schedule.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function toggleSchedule(scheduleId: string, enabled: boolean) {
+    if (!user) return;
+    setBusyKey(`schedule:${scheduleId}`);
+    setError(null);
+    try {
+      await setScheduleEnabled(scheduleId, enabled, user.name);
+      setNotice(`Schedule ${enabled ? 'enabled' : 'disabled'}.`);
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to change schedule status.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function removeSchedule(scheduleId: string) {
+    if (!window.confirm('Delete this schedule?')) return;
+    setBusyKey(`schedule:${scheduleId}`);
+    setError(null);
+    try {
+      await deleteSchedule(scheduleId);
+      setNotice('Schedule deleted.');
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to delete this schedule.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function bulkExceptionStatus(status: StoredException['status']) {
+    if (!user) return;
+    const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
+    if (!selected.length) { setError('Select at least one exception.'); return; }
+    const reason = status === 'resolved' || status === 'accepted' ? window.prompt(`Reason for marking ${status}`)?.trim() : undefined;
+    if ((status === 'resolved' || status === 'accepted') && !reason) { setError('A reason is required when resolving or accepting exceptions.'); return; }
+    await applyBulkExceptionAction(selected, { kind: 'status', status, reason });
+  }
+
+  async function bulkExceptionAssign() {
+    const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
+    if (!selected.length) { setError('Select at least one exception.'); return; }
+    const owner = window.prompt('Assign selected exceptions to owner (leave blank to clear)', '') ?? '';
+    await applyBulkExceptionAction(selected, { kind: 'assign', owner });
+  }
+
+  async function bulkExceptionComment() {
+    const selected = exceptions.filter((exception) => selectedExceptionIds.includes(exception.id));
+    if (!selected.length) { setError('Select at least one exception.'); return; }
+    const comment = window.prompt('Comment to add to selected exceptions')?.trim();
+    if (!comment) { setError('Enter a comment for the selected exceptions.'); return; }
+    await applyBulkExceptionAction(selected, { kind: 'comment', comment });
+  }
+
+  async function applyBulkExceptionAction(
+    selected: StoredException[],
+    action: Parameters<typeof bulkUpdateExceptions>[1]
+  ) {
+    if (!user) return;
+    setBusyKey('bulk-exceptions');
+    setError(null);
+    try {
+      const result = await bulkUpdateExceptions(selected, action, user.id, user.name);
+      if (result.succeeded.length) setNotice(`${result.succeeded.length} exception${result.succeeded.length === 1 ? '' : 's'} updated.`);
+      if (result.failed.length) setError(result.failed.map((failure) => `${failure.businessKey}: ${failure.message}`).join(' '));
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to update selected exceptions.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function removeRun(run: StoredRun) {
+    if (!window.confirm(`Delete run for "${run.ruleName}" started ${formatDate(run.startedAt)}?`)) return;
+    setBusyKey(`delete-run:${run.id}`);
+    setError(null);
+    try {
+      const result = await deleteRun(run.id);
+      if (selectedRun?.id === run.id) setSelectedRun(null);
+      setNotice(`Run deleted. ${result.findingsDeleted} finding${result.findingsDeleted === 1 ? '' : 's'} deleted, ${result.exceptionsRepointed} exception${result.exceptionsRepointed === 1 ? '' : 's'} repointed.`);
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to delete this run.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function checkOrphans() {
+    setBusyKey('orphans');
+    setError(null);
+    try { setOrphanReport(await findOrphans()); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to find orphaned reconciliation rows.'); }
+    finally { setBusyKey(''); }
+  }
+
+  async function purgeOrphanRows() {
+    if (!window.confirm('Purge orphaned runs, exceptions, findings, schedules, and events?')) return;
+    setBusyKey('purge-orphans');
+    setError(null);
+    try {
+      const result = await purgeOrphans();
+      setNotice(`Purged ${result.runs} runs, ${result.exceptions} exceptions, ${result.findings} findings, ${result.events} events, and ${result.schedules} schedules.`);
+      setOrphanReport(await findOrphans());
+      await refreshData();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to purge orphaned reconciliation rows.'); }
     finally { setBusyKey(''); }
   }
 
@@ -456,7 +679,7 @@ export function ReconciliationPage() {
             <h1 className="mt-1 text-2xl font-semibold">Reconciliation</h1>
           </div>
           <div className="flex items-center gap-3">
-            <div className="hidden text-right sm:block"><p className="text-sm font-medium">{userName}</p><p className="text-xs text-slate-500">User-scoped controls and results</p></div>
+            <div className="hidden text-right sm:block"><p className="text-sm font-medium">{userName}</p><p className="text-xs text-slate-500">Workspace-shared controls and results</p></div>
             <button type="button" onClick={() => void signOut()} className={secondaryButton}>Sign out</button>
           </div>
         </div>
@@ -480,7 +703,8 @@ export function ReconciliationPage() {
         {!data && <div className="border border-slate-200 bg-white px-5 py-8 text-sm text-slate-600">{loading ? 'Loading reconciliation data...' : 'No reconciliation data is available yet. Configure the Rayfin data service and refresh.'}</div>}
 
         {tab === 'overview' && data && <OverviewPanel
-          rules={rules} runs={runs} openExceptions={openExceptions} onNavigate={setTab}
+          rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
+          onNavigate={setTab} onFindOrphans={() => void checkOrphans()} onPurgeOrphans={() => void purgeOrphanRows()}
         />}
         {tab === 'sources' && <SourcesPanel
           sources={sources} catalogs={catalogs} busyKey={busyKey}
@@ -488,21 +712,31 @@ export function ReconciliationPage() {
         />}
         {tab === 'rules' && data && <RulesPanel
           rules={rules} sources={sources} draft={draft} objectsForSource={sourceObjects} busyKey={busyKey}
+          selectedRuleIds={selectedRuleIds} onSelectedRuleIds={setSelectedRuleIds}
           versionHistory={versionHistory} onNew={openNewRule} onEdit={openEditRule} onDraft={setDraftValue}
           onSelectSource={selectRuleSource} onUpdateField={updateField} onAddField={() => setDraft((current) => current ? { ...current, compareFields: [...current.compareFields, blankField(current.compareFields.length)] } : current)}
           onRemoveField={(index) => setDraft((current) => current ? { ...current, compareFields: current.compareFields.filter((_, fieldIndex) => fieldIndex !== index) } : current)}
           onSave={() => void saveCurrentRule()} onCancel={() => { setDraft(null); setVersionHistory(null); }}
-          onToggle={toggleRule} onVersions={showVersions} onRun={runRule}
+          onToggle={toggleRule} onVersions={showVersions} onRun={runRule} onRunSelected={() => void runSelectedRules()}
+          onBulkStatus={(enabled) => void bulkChangeRuleStatus(enabled)} onRetire={(rule) => void retireSelectedRule(rule)}
           onRegisterSource={(side) => void openSourceRegistration(side)}
         />}
+        {tab === 'schedules' && data && <SchedulesPanel
+          schedules={schedules} rules={rules} draft={scheduleDraft} busyKey={busyKey}
+          onNew={openNewSchedule} onEdit={openEditSchedule} onDraft={setScheduleDraft}
+          onSave={() => void saveCurrentSchedule()} onCancel={() => setScheduleDraft(null)}
+          onToggle={(schedule, enabled) => void toggleSchedule(schedule.id, enabled)}
+          onDelete={(schedule) => void removeSchedule(schedule.id)}
+        />}
         {tab === 'exceptions' && data && <ExceptionsPanel
-          exceptions={filteredExceptions} allExceptions={exceptions} filter={exceptionFilter} selected={selectedException}
-          events={exceptionEvents} owner={ownerInput} comment={commentInput} reason={closeReason} busyKey={busyKey}
+          exceptions={filteredExceptions} allExceptions={exceptions} rules={rules} runs={runs} filter={exceptionFilter} selected={selectedException}
+          selectedIds={selectedExceptionIds} events={exceptionEvents} owner={ownerInput} comment={commentInput} reason={closeReason} busyKey={busyKey}
           onFilter={setExceptionFilter} onSelect={setSelectedException} onOwner={setOwnerInput} onComment={setCommentInput}
           onReason={setCloseReason} onAssign={() => void saveExceptionOwner()} onAddComment={() => void saveExceptionComment()}
-          onStatus={(status) => void changeExceptionStatus(status)}
+          onStatus={(status) => void changeExceptionStatus(status)} onSelectedIds={setSelectedExceptionIds}
+          onBulkStatus={(status) => void bulkExceptionStatus(status)} onBulkAssign={() => void bulkExceptionAssign()} onBulkComment={() => void bulkExceptionComment()}
         />}
-        {tab === 'runs' && data && <RunsPanel runs={runs} selectedRun={selectedRun} findings={runFindings} onDetails={setSelectedRun} onCompare={(run) => {
+        {tab === 'runs' && data && <RunsPanel runs={runs} selectedRun={selectedRun} findings={runFindings} busyKey={busyKey} onDetails={setSelectedRun} onDelete={(run) => void removeRun(run)} onCompare={(run) => {
           setComparisonRuleId(run.rule_id);
           const sameRule = runs.filter((candidate) => candidate.rule_id === run.rule_id && candidate.status === 'completed');
           setFromRunId(sameRule[1]?.id ?? '');
@@ -525,12 +759,16 @@ export function ReconciliationPage() {
 }
 
 function OverviewPanel({
-  rules, runs, openExceptions, onNavigate,
+  rules, runs, openExceptions, orphanReport, busyKey, onNavigate, onFindOrphans, onPurgeOrphans,
 }: {
   rules: StoredRule[];
   runs: StoredRun[];
   openExceptions: StoredException[];
+  orphanReport: OrphanReport | null;
+  busyKey: string;
   onNavigate: (tab: Tab) => void;
+  onFindOrphans: () => void;
+  onPurgeOrphans: () => void;
 }) {
   const recentRuns = runs.slice(0, 8);
   const groupCounts = ruleGroups.map(([key, label]) => ({
@@ -565,6 +803,15 @@ function OverviewPanel({
       <section className="border border-slate-200 bg-white">
         <SectionTitle title="Priority work" action={<button type="button" onClick={() => onNavigate('exceptions')} className="text-sm font-medium text-teal-800 hover:underline">Review exceptions</button>} />
         {openExceptions.length ? <ul className="divide-y divide-slate-100">{openExceptions.slice(0, 6).map((exception) => <li key={exception.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div><p className="text-sm font-medium">{exception.businessKey}</p><p className="mt-0.5 text-xs text-slate-500">{humanOutcome(exception.outcome)} · last seen {formatDate(exception.lastSeen)}</p></div><div className="flex items-center gap-3"><SeverityPill value={exception.severity} /><span className="text-xs text-slate-500">{exception.occurrenceCount} occurrence{exception.occurrenceCount === 1 ? '' : 's'}</span></div></li>)}</ul> : <EmptyMessage>No active exceptions.</EmptyMessage>}
+      </section>
+      <section className="border border-slate-200 bg-white">
+        <SectionTitle title="Maintenance" subtitle="Find and purge reconciliation rows whose owning rule no longer exists." action={<div className="flex gap-2"><button type="button" onClick={onFindOrphans} disabled={busyKey === 'orphans'} className={secondaryButton}>{busyKey === 'orphans' ? 'Checking...' : 'Check orphans'}</button><button type="button" onClick={onPurgeOrphans} disabled={busyKey === 'purge-orphans'} className={secondaryButton}>Purge orphans</button></div>} />
+        {orphanReport ? <div className="grid gap-px bg-slate-200 sm:grid-cols-4">
+          <Metric label="Orphan runs" value={orphanReport.runs.length} onClick={() => undefined} />
+          <Metric label="Orphan exceptions" value={orphanReport.exceptions.length} onClick={() => undefined} />
+          <Metric label="Orphan findings" value={orphanReport.findings} onClick={() => undefined} />
+          <Metric label="Orphan schedules" value={orphanReport.schedules.length} onClick={() => undefined} />
+        </div> : <EmptyMessage>Run a maintenance check to see orphaned row counts.</EmptyMessage>}
       </section>
     </div>
   );
@@ -624,13 +871,14 @@ function SourceRegistrationModal({ workspaces, loading, filter, busyKey, onFilte
 }
 
 function RulesPanel({
-  rules, sources, draft, objectsForSource, busyKey, versionHistory, onNew, onEdit, onDraft, onSelectSource, onUpdateField, onAddField, onRemoveField, onSave, onCancel, onToggle, onVersions, onRun, onRegisterSource,
+  rules, sources, draft, objectsForSource, busyKey, selectedRuleIds, versionHistory, onNew, onEdit, onDraft, onSelectSource, onUpdateField, onAddField, onRemoveField, onSave, onCancel, onToggle, onVersions, onRun, onRunSelected, onBulkStatus, onRetire, onRegisterSource, onSelectedRuleIds,
 }: {
   rules: StoredRule[];
   sources: AppData['sources'];
   draft: RuleDraft | null;
   objectsForSource: (id: string) => SqlObject[];
   busyKey: string;
+  selectedRuleIds: string[];
   versionHistory: Array<Record<string, unknown>> | null;
   onNew: () => void;
   onEdit: (rule: StoredRule) => void;
@@ -644,13 +892,19 @@ function RulesPanel({
   onToggle: (rule: StoredRule) => void;
   onVersions: (rule: StoredRule) => void;
   onRun: (rule: StoredRule) => void;
+  onRunSelected: () => void;
+  onBulkStatus: (enabled: boolean) => void;
+  onRetire: (rule: StoredRule) => void;
   onRegisterSource: (side: 'A' | 'B') => void;
+  onSelectedRuleIds: (ids: string[]) => void;
 }) {
+  const toggleSelection = (ruleId: string, checked: boolean) => onSelectedRuleIds(checked ? [...selectedRuleIds, ruleId] : selectedRuleIds.filter((id) => id !== ruleId));
+  const selectableIds = rules.map((rule) => rule.id);
   return <div className="space-y-5">
     <section className="border border-slate-200 bg-white">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h3 className="font-semibold">Reconciliation rules</h3><p className="mt-1 text-sm text-slate-500">Definitions are versioned on every save or status change.</p></div><button type="button" onClick={onNew} className={primaryButton}>New rule</button></div>
-      {rules.length ? <div className="overflow-x-auto"><table className="w-full min-w-[920px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Group</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5 text-right">Version</th><th className="px-4 py-2.5 text-right">Actions</th></tr></thead><tbody className="divide-y divide-slate-100">
-        {rules.map((rule) => <tr key={rule.id}><td className="px-4 py-3"><p className="font-medium">{rule.name}</p><p className="text-xs text-slate-500">{rule.businessArea || 'Unassigned area'} · {rule.priority} priority</p></td><td className="px-4 py-3 text-slate-600">{ruleGroups.find(([key]) => key === rule.ruleGroup)?.[1] ?? 'Ungrouped'}</td><td className="px-4 py-3"><StatusPill value={rule.status} /></td><td className="px-4 py-3 text-slate-600">{rule.owner || 'Unassigned'}</td><td className="px-4 py-3 text-right tabular-nums">v{rule.version}</td><td className="px-4 py-3"><div className="flex justify-end gap-3"><button type="button" onClick={() => onEdit(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-teal-800 hover:underline">Edit</button><button type="button" onClick={() => onVersions(rule)} disabled={busyKey === `versions:${rule.id}`} className="text-xs font-semibold text-slate-600 hover:underline">Versions</button>{rule.enabled ? <button type="button" onClick={() => onToggle(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-amber-800 hover:underline">Disable</button> : <button type="button" onClick={() => onToggle(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-teal-800 hover:underline">Enable</button>}{rule.enabled && <button type="button" onClick={() => onRun(rule)} disabled={busyKey === `run:${rule.id}`} className="text-xs font-semibold text-blue-800 hover:underline">{busyKey === `run:${rule.id}` ? 'Running...' : 'Run now'}</button>}</div></td></tr>)}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h3 className="font-semibold">Reconciliation rules</h3><p className="mt-1 text-sm text-slate-500">Definitions are versioned on every save or status change.</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={onRunSelected} disabled={!selectedRuleIds.length || busyKey === 'run-selected'} className={secondaryButton}>{busyKey === 'run-selected' ? 'Running...' : 'Run selected'}</button><button type="button" onClick={() => onBulkStatus(true)} disabled={!selectedRuleIds.length} className={secondaryButton}>Enable selected</button><button type="button" onClick={() => onBulkStatus(false)} disabled={!selectedRuleIds.length} className={secondaryButton}>Disable selected</button><button type="button" onClick={onNew} className={primaryButton}>New rule</button></div></div>
+      {rules.length ? <div className="overflow-x-auto"><table className="w-full min-w-[980px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5"><input type="checkbox" aria-label="Select all rules" checked={selectableIds.length > 0 && selectableIds.every((id) => selectedRuleIds.includes(id))} onChange={(event) => onSelectedRuleIds(event.target.checked ? selectableIds : [])} /></th><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Group</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5 text-right">Version</th><th className="px-4 py-2.5 text-right">Actions</th></tr></thead><tbody className="divide-y divide-slate-100">
+        {rules.map((rule) => <tr key={rule.id} className={rule.status === 'retired' ? 'bg-slate-50 text-slate-500' : ''}><td className="px-4 py-3"><input type="checkbox" aria-label={`Select ${rule.name}`} checked={selectedRuleIds.includes(rule.id)} onChange={(event) => toggleSelection(rule.id, event.target.checked)} /></td><td className="px-4 py-3"><p className="font-medium">{rule.name}</p><p className="text-xs text-slate-500">{rule.businessArea || 'Unassigned area'} · {rule.priority} priority</p></td><td className="px-4 py-3 text-slate-600">{ruleGroups.find(([key]) => key === rule.ruleGroup)?.[1] ?? 'Ungrouped'}</td><td className="px-4 py-3"><StatusPill value={rule.status} /></td><td className="px-4 py-3 text-slate-600">{rule.owner || 'Unassigned'}</td><td className="px-4 py-3 text-right tabular-nums">v{rule.version}</td><td className="px-4 py-3"><div className="flex justify-end gap-3"><button type="button" onClick={() => onEdit(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-teal-800 hover:underline">Edit</button><button type="button" onClick={() => onVersions(rule)} disabled={busyKey === `versions:${rule.id}`} className="text-xs font-semibold text-slate-600 hover:underline">Versions</button>{rule.status !== 'retired' && (rule.enabled ? <button type="button" onClick={() => onToggle(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-amber-800 hover:underline">Disable</button> : <button type="button" onClick={() => onToggle(rule)} disabled={busyKey === `rule:${rule.id}`} className="text-xs font-semibold text-teal-800 hover:underline">Enable</button>)}{rule.enabled && rule.status !== 'retired' && <button type="button" onClick={() => onRun(rule)} disabled={busyKey === `run:${rule.id}`} className="text-xs font-semibold text-blue-800 hover:underline">{busyKey === `run:${rule.id}` ? 'Running...' : 'Run now'}</button>}{rule.status !== 'retired' && <button type="button" onClick={() => onRetire(rule)} disabled={busyKey === `retire:${rule.id}`} className="text-xs font-semibold text-red-700 hover:underline">Retire</button>}</div></td></tr>)}
       </tbody></table></div> : <EmptyMessage>No rules yet. Create a rule after registering SQL sources.</EmptyMessage>}
     </section>
 
@@ -720,6 +974,10 @@ function RuleEditor({
               <div><label className={labelClass}>Allowed diff.</label><input className={input} type="number" min="0" step="any" disabled={!field.tolerance} value={field.tolerance?.value ?? ''} onChange={(event) => onUpdateField(index, (current) => ({ ...current, tolerance: current.tolerance ? { ...current.tolerance, value: Number(event.target.value) } : undefined }))} /></div>
               <div className="flex items-end"><button type="button" onClick={() => onRemoveField(index)} disabled={draft.compareFields.length === 1} className="mb-1 text-xs font-medium text-red-700 hover:underline disabled:opacity-40">Remove</button></div>
             </div>
+            {field.type === 'string' && <div className="mb-3 flex flex-wrap gap-4 text-sm">
+              <label className="inline-flex items-center gap-2"><input type="checkbox" checked={field.caseInsensitive === true} onChange={(event) => onUpdateField(index, (current) => ({ ...current, caseInsensitive: event.target.checked }))} />Ignore case</label>
+              <label className="inline-flex items-center gap-2"><input type="checkbox" checked={field.trim !== false} onChange={(event) => onUpdateField(index, (current) => ({ ...current, trim: event.target.checked }))} />Trim whitespace</label>
+            </div>}
             <div className="grid gap-3 lg:grid-cols-2">
               <OperandEditor title="Left side" operand={field.a} object={selectedA} onChange={(operand) => onUpdateField(index, (current) => ({ ...current, a: operand }))} />
               <OperandEditor title="Right side" operand={field.b} object={selectedB} onChange={(operand) => onUpdateField(index, (current) => ({ ...current, b: operand }))} />
@@ -773,17 +1031,63 @@ function OperandEditor({ title, operand, object, onChange }: {
   </fieldset>;
 }
 
-function ExceptionsPanel({ exceptions, allExceptions, filter, selected, events, owner, comment, reason, busyKey, onFilter, onSelect, onOwner, onComment, onReason, onAssign, onAddComment, onStatus }: {
+const weekDays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function SchedulesPanel({ schedules, rules, draft, busyKey, onNew, onEdit, onDraft, onSave, onCancel, onToggle, onDelete }: {
+  schedules: AppData['schedules'];
+  rules: StoredRule[];
+  draft: ScheduleDraft | null;
+  busyKey: string;
+  onNew: () => void;
+  onEdit: (schedule: AppData['schedules'][number]) => void;
+  onDraft: (draft: ScheduleDraft | null) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  onToggle: (schedule: AppData['schedules'][number], enabled: boolean) => void;
+  onDelete: (schedule: AppData['schedules'][number]) => void;
+}) {
+  const runnableRules = rules.filter((rule) => rule.status === 'active' || rule.status !== 'retired');
+  const preview = (() => {
+    if (!draft) return '';
+    try { return formatDate(nextOccurrence(draft, new Date())); } catch { return 'Complete the schedule to preview the next occurrence.'; }
+  })();
+  return <div className="space-y-5">
+    <section className="border border-slate-200 bg-white">
+      <SectionTitle title="Schedules" subtitle="Schedules run while this app is open in a signed-in browser. Claiming a due slot advances the next due time automatically." action={<button type="button" onClick={onNew} className={primaryButton}>New schedule</button>} />
+      {schedules.length ? <div className="overflow-x-auto"><table className="w-full min-w-[980px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Cadence</th><th className="px-4 py-2.5">Enabled</th><th className="px-4 py-2.5">Next due</th><th className="px-4 py-2.5">Last triggered</th><th className="px-4 py-2.5">Last status</th><th className="px-4 py-2.5 text-right">Actions</th></tr></thead><tbody className="divide-y divide-slate-100">
+        {schedules.map((schedule) => <tr key={schedule.id}><td className="px-4 py-3"><p className="font-medium">{schedule.ruleName}</p>{schedule.lastError && <p className="mt-1 text-xs text-red-700">{schedule.lastError}</p>}</td><td className="px-4 py-3 text-slate-600">{describeSchedule(schedule)}</td><td className="px-4 py-3"><label className="inline-flex items-center gap-2 text-xs"><input type="checkbox" checked={schedule.enabled} onChange={(event) => onToggle(schedule, event.target.checked)} disabled={busyKey === `schedule:${schedule.id}`} />Enabled</label></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(schedule.nextDueAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(schedule.lastTriggeredAt)}</td><td className="px-4 py-3"><StatusPill value={schedule.lastStatus} /></td><td className="px-4 py-3"><div className="flex justify-end gap-3"><button type="button" onClick={() => onEdit(schedule)} className="text-xs font-semibold text-teal-800 hover:underline">Edit</button><button type="button" onClick={() => onDelete(schedule)} disabled={busyKey === `schedule:${schedule.id}`} className="text-xs font-semibold text-red-700 hover:underline">Delete</button></div></td></tr>)}
+      </tbody></table></div> : <EmptyMessage>No schedules have been created.</EmptyMessage>}
+    </section>
+    {draft && <section className="border border-slate-200 bg-white">
+      <SectionTitle title={draft.id ? 'Edit schedule' : 'New schedule'} subtitle={`Next occurrence: ${preview}`} action={<button type="button" onClick={onCancel} className="text-sm text-slate-600 hover:underline">Close</button>} />
+      <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-6">
+        <div className="xl:col-span-2"><label className={labelClass}>Rule</label><select className={input} value={draft.ruleId} onChange={(event) => onDraft({ ...draft, ruleId: event.target.value })}><option value="">Choose a rule</option>{runnableRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div>
+        <div><label className={labelClass}>Cadence</label><select className={input} value={draft.cadence} onChange={(event) => onDraft({ ...draft, cadence: event.target.value as ScheduleDefinition['cadence'] })}><option value="hourly">Hourly</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></div>
+        <div><label className={labelClass}>Every</label><input className={input} type="number" min={1} max={52} value={draft.intervalCount} onChange={(event) => onDraft({ ...draft, intervalCount: Number(event.target.value) })} /></div>
+        {draft.cadence !== 'hourly' && <div><label className={labelClass}>Hour UTC</label><input className={input} type="number" min={0} max={23} value={draft.hourUtc} onChange={(event) => onDraft({ ...draft, hourUtc: Number(event.target.value) })} /></div>}
+        <div><label className={labelClass}>Minute UTC</label><input className={input} type="number" min={0} max={59} value={draft.minuteUtc} onChange={(event) => onDraft({ ...draft, minuteUtc: Number(event.target.value) })} /></div>
+        {draft.cadence === 'weekly' && <div><label className={labelClass}>Day of week</label><select className={input} value={draft.dayOfWeek ?? 0} onChange={(event) => onDraft({ ...draft, dayOfWeek: Number(event.target.value) })}>{weekDays.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></div>}
+        <div className="flex items-end"><label className="inline-flex min-h-9 items-center gap-2 text-sm"><input type="checkbox" checked={draft.enabled} onChange={(event) => onDraft({ ...draft, enabled: event.target.checked })} />Enabled</label></div>
+        <div className="flex items-end justify-end gap-2 xl:col-span-6"><button type="button" onClick={onCancel} className={secondaryButton}>Cancel</button><button type="button" onClick={onSave} disabled={busyKey === 'save-schedule'} className={primaryButton}>{busyKey === 'save-schedule' ? 'Saving...' : 'Save schedule'}</button></div>
+      </div>
+    </section>}
+  </div>;
+}
+
+function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selected, selectedIds, events, owner, comment, reason, busyKey, onFilter, onSelect, onOwner, onComment, onReason, onAssign, onAddComment, onStatus, onSelectedIds, onBulkStatus, onBulkAssign, onBulkComment }: {
   exceptions: StoredException[];
   allExceptions: StoredException[];
-  filter: { status: string; severity: string; outcome: string };
+  rules: StoredRule[];
+  runs: StoredRun[];
+  filter: ExceptionFilter;
   selected: StoredException | null;
+  selectedIds: string[];
   events: Array<Record<string, unknown>>;
   owner: string;
   comment: string;
   reason: string;
   busyKey: string;
-  onFilter: (filter: { status: string; severity: string; outcome: string }) => void;
+  onFilter: (filter: ExceptionFilter) => void;
   onSelect: (exception: StoredException) => void;
   onOwner: (value: string) => void;
   onComment: (value: string) => void;
@@ -791,8 +1095,15 @@ function ExceptionsPanel({ exceptions, allExceptions, filter, selected, events, 
   onAssign: () => void;
   onAddComment: () => void;
   onStatus: (status: StoredException['status']) => void;
+  onSelectedIds: (ids: string[]) => void;
+  onBulkStatus: (status: StoredException['status']) => void;
+  onBulkAssign: () => void;
+  onBulkComment: () => void;
 }) {
   const outcomes = [...new Set(allExceptions.map((exception) => exception.outcome))];
+  const runIds = [...new Set(allExceptions.map((exception) => exception.lastRunId).filter(Boolean))];
+  const toggleSelection = (exceptionId: string, checked: boolean) => onSelectedIds(checked ? [...selectedIds, exceptionId] : selectedIds.filter((id) => id !== exceptionId));
+  const visibleIds = exceptions.map((exception) => exception.id);
   const allowed: Record<StoredException['status'], StoredException['status'][]> = {
     open: ['acknowledged', 'investigating', 'resolved', 'accepted'],
     acknowledged: ['investigating', 'resolved', 'accepted', 'open'],
@@ -802,9 +1113,9 @@ function ExceptionsPanel({ exceptions, allExceptions, filter, selected, events, 
   };
   return <div className="grid gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.8fr)]">
     <section className="border border-slate-200 bg-white">
-      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-3"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div></div>
-      <div className="border-b border-slate-100 px-4 py-2 text-xs text-slate-500">{exceptions.length} of {allExceptions.length} exceptions</div>
-      {exceptions.length ? <div className="max-h-[680px] overflow-auto"><table className="w-full min-w-[700px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5">Business key</th><th className="px-4 py-2.5">Outcome</th><th className="px-4 py-2.5">Severity</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5">Last seen</th></tr></thead><tbody className="divide-y divide-slate-100">{exceptions.map((exception) => <tr key={exception.id} className={selected?.id === exception.id ? 'bg-teal-50' : 'hover:bg-slate-50'}><td className="px-4 py-2.5"><button type="button" onClick={() => onSelect(exception)} className="text-left font-semibold text-teal-900 hover:underline">{exception.businessKey}</button></td><td className="px-4 py-2.5 text-slate-600">{humanOutcome(exception.outcome)}</td><td className="px-4 py-2.5"><SeverityPill value={exception.severity} /></td><td className="px-4 py-2.5"><StatusPill value={exception.status} /></td><td className="px-4 py-2.5 text-slate-600">{exception.owner || 'Unassigned'}</td><td className="px-4 py-2.5 text-xs text-slate-500">{formatDate(exception.lastSeen)}</td></tr>)}</tbody></table></div> : <EmptyMessage>No exceptions match this filter.</EmptyMessage>}
+      <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-2 xl:grid-cols-4"><div><label className={labelClass}>Status</label><select className={input} value={filter.status} onChange={(event) => onFilter({ ...filter, status: event.target.value })}><option value="">All statuses</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select></div><div><label className={labelClass}>Severity</label><select className={input} value={filter.severity} onChange={(event) => onFilter({ ...filter, severity: event.target.value })}><option value="">All severities</option>{severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}</select></div><div><label className={labelClass}>Outcome</label><select className={input} value={filter.outcome} onChange={(event) => onFilter({ ...filter, outcome: event.target.value })}><option value="">All outcomes</option>{outcomes.map((outcome) => <option key={outcome} value={outcome}>{humanOutcome(outcome)}</option>)}</select></div><div><label className={labelClass}>Rule</label><select className={input} value={filter.ruleId} onChange={(event) => onFilter({ ...filter, ruleId: event.target.value })}><option value="">All rules</option>{rules.map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></div><div><label className={labelClass}>Rule group</label><select className={input} value={filter.ruleGroup} onChange={(event) => onFilter({ ...filter, ruleGroup: event.target.value })}><option value="">All groups</option>{ruleGroups.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></div><div><label className={labelClass}>Run</label><select className={input} value={filter.runId} onChange={(event) => onFilter({ ...filter, runId: event.target.value })}><option value="">All runs</option>{runIds.map((runId) => <option key={runId} value={runId}>{runs.find((run) => run.id === runId)?.ruleName ?? 'Run'} · {runId.slice(0, 8)}</option>)}</select></div><div><label className={labelClass}>Owner contains</label><input className={input} value={filter.owner} onChange={(event) => onFilter({ ...filter, owner: event.target.value })} placeholder="name or team" /></div></div>
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2 text-xs text-slate-500"><span>{exceptions.length} of {allExceptions.length} exceptions · {selectedIds.length} selected</span><div className="flex flex-wrap gap-2"><select className={input} value="" aria-label="Bulk status" onChange={(event) => { if (event.target.value) onBulkStatus(event.target.value as StoredException['status']); }} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'}><option value="">Bulk status...</option>{statuses.map((status) => <option key={status} value={status}>{status}</option>)}</select><button type="button" onClick={onBulkAssign} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Assign selected</button><button type="button" onClick={onBulkComment} disabled={!selectedIds.length || busyKey === 'bulk-exceptions'} className={secondaryButton}>Comment selected</button></div></div>
+      {exceptions.length ? <div className="max-h-[680px] overflow-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5"><input type="checkbox" aria-label="Select visible exceptions" checked={visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id))} onChange={(event) => onSelectedIds(event.target.checked ? [...new Set([...selectedIds, ...visibleIds])] : selectedIds.filter((id) => !visibleIds.includes(id)))} /></th><th className="px-4 py-2.5">Business key</th><th className="px-4 py-2.5">Outcome</th><th className="px-4 py-2.5">Severity</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5">Owner</th><th className="px-4 py-2.5">Last seen</th></tr></thead><tbody className="divide-y divide-slate-100">{exceptions.map((exception) => <tr key={exception.id} className={selected?.id === exception.id ? 'bg-teal-50' : 'hover:bg-slate-50'}><td className="px-4 py-2.5"><input type="checkbox" aria-label={`Select exception ${exception.businessKey}`} checked={selectedIds.includes(exception.id)} onChange={(event) => toggleSelection(exception.id, event.target.checked)} /></td><td className="px-4 py-2.5"><button type="button" onClick={() => onSelect(exception)} className="text-left font-semibold text-teal-900 hover:underline">{exception.businessKey}</button></td><td className="px-4 py-2.5 text-slate-600">{humanOutcome(exception.outcome)}</td><td className="px-4 py-2.5"><SeverityPill value={exception.severity} /></td><td className="px-4 py-2.5"><StatusPill value={exception.status} /></td><td className="px-4 py-2.5 text-slate-600">{exception.owner || 'Unassigned'}</td><td className="px-4 py-2.5 text-xs text-slate-500">{formatDate(exception.lastSeen)}</td></tr>)}</tbody></table></div> : <EmptyMessage>No exceptions match this filter.</EmptyMessage>}
     </section>
     <section className="border border-slate-200 bg-white">
       <SectionTitle title={selected ? `Exception · ${selected.businessKey}` : 'Exception detail'} subtitle={selected ? `${humanOutcome(selected.outcome)} · ${selected.occurrenceCount} sighting${selected.occurrenceCount === 1 ? '' : 's'}` : 'Select a row to inspect and update its history.'} />
@@ -821,9 +1132,9 @@ function ExceptionsPanel({ exceptions, allExceptions, filter, selected, events, 
   </div>;
 }
 
-function RunsPanel({ runs, selectedRun, findings, onDetails, onCompare }: { runs: StoredRun[]; selectedRun: StoredRun | null; findings: ReconciliationFinding[]; onDetails: (run: StoredRun) => void; onCompare: (run: StoredRun) => void }) {
+function RunsPanel({ runs, selectedRun, findings, busyKey, onDetails, onCompare, onDelete }: { runs: StoredRun[]; selectedRun: StoredRun | null; findings: ReconciliationFinding[]; busyKey: string; onDetails: (run: StoredRun) => void; onCompare: (run: StoredRun) => void; onDelete: (run: StoredRun) => void }) {
   return <section className="border border-slate-200 bg-white"><SectionTitle title="Run history" subtitle="Every run retains the rule version, counts, and per-item findings." />
-    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100">{runs.map((run) => <tr key={run.id} className={selectedRun?.id === run.id ? 'bg-teal-50' : ''}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3"><button type="button" onClick={() => onDetails(run)} className="text-xs font-semibold text-slate-700 hover:underline">Details</button>{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-teal-800 hover:underline">Compare</button>}</div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
+    {runs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Completed</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Rows A</th><th className="px-4 py-2.5 text-right">Rows B</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100">{runs.map((run) => <tr key={run.id} className={selectedRun?.id === run.id ? 'bg-teal-50' : ''}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3 text-xs text-slate-600">{formatDate(run.completedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.recordsA}</td><td className="px-4 py-3 text-right tabular-nums">{run.recordsB}</td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><div className="flex justify-end gap-3"><button type="button" onClick={() => onDetails(run)} className="text-xs font-semibold text-slate-700 hover:underline">Details</button>{run.status === 'completed' && <button type="button" onClick={() => onCompare(run)} className="text-xs font-semibold text-teal-800 hover:underline">Compare</button>}<button type="button" onClick={() => onDelete(run)} disabled={run.status === 'running' || busyKey === `delete-run:${run.id}`} className="text-xs font-semibold text-red-700 hover:underline disabled:opacity-40">Delete</button></div></td></tr>)}</tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
     {selectedRun && <div className="border-t border-slate-200"><SectionTitle title={`Run findings · ${selectedRun.ruleName}`} subtitle={`Version ${selectedRun.ruleVersion} · ${findings.length} findings stored`} />{findings.length ? <div className="divide-y divide-slate-100">{findings.slice(0, 500).map((finding) => <div key={finding.fingerprint} className="flex flex-wrap items-start justify-between gap-3 px-4 py-3"><div><p className="text-sm font-semibold">{finding.businessKey}</p><p className="mt-1 text-xs text-slate-500">{humanOutcome(finding.outcome)}{finding.differences.length ? ` · ${finding.differences.map((difference) => difference.field).join(', ')}` : ''}</p></div><SeverityPill value={finding.severity} /></div>)}</div> : selectedRun.exceptionCount > 0 ? <EmptyMessage>This run has totals but no detailed findings.</EmptyMessage> : <EmptyMessage>This run completed with no findings.</EmptyMessage>}</div>}
   </section>;
 }
@@ -859,10 +1170,42 @@ function ComparePanel({ rules, runs, ruleId, fromRunId, toRunId, result, busy, o
       <button type="button" onClick={onCompare} disabled={busy || !fromRunId || !toRunId} className={primaryButton}>{busy ? 'Comparing...' : 'Compare'}</button>
     </div><div className="border-t border-slate-100 px-4 py-3 text-xs text-slate-500">Runs from different rules cannot be compared. Findings are matched by stable business-key fingerprints.</div></section>
     {result && <>
-      <div className="grid gap-px border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4"><Metric label="Newly failing" value={result.newlyFailing.length} onClick={() => undefined} /><Metric label="Fixed" value={result.fixed.length} onClick={() => undefined} /><Metric label="Still failing" value={result.stillFailing.length} onClick={() => undefined} /><Metric label="Change in exception count" value={result.metrics.exceptionCount} onClick={() => undefined} /></div>
-      <div className="grid gap-5 xl:grid-cols-3"><FindingList title="Newly failing" findings={result.newlyFailing} tone="red" /><FindingList title="Fixed" findings={result.fixed} tone="teal" /><FindingList title="Still failing" findings={result.stillFailing} tone="amber" /></div>
+      <section className="border border-slate-200 bg-white">
+        <SectionTitle title="Comparison verdict" action={<VerdictPill verdict={result.verdict} />} />
+        <div className="space-y-3 p-4">
+          {result.reversed && <p className="text-sm text-amber-800">The selected runs were reordered into chronological order.</p>}
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">{Object.entries(result.metrics).map(([key, value]) => <MetricDeltaCard key={key} label={key.replace(/([A-Z])/g, ' $1')} value={value} />)}</div>
+        </div>
+      </section>
+      <div className="grid gap-px border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4"><Metric label="Newly failing" value={result.newlyFailing.length} onClick={() => undefined} /><Metric label="Fixed" value={result.fixed.length} onClick={() => undefined} /><Metric label="Still failing" value={result.stillFailing.length} onClick={() => undefined} /><Metric label="Changed" value={result.changed.length} onClick={() => undefined} /></div>
+      <div className="grid gap-5 xl:grid-cols-4"><FindingList title="Newly failing" findings={result.newlyFailing} tone="red" /><FindingList title="Fixed" findings={result.fixed} tone="teal" /><FindingList title="Still failing" findings={result.stillFailing} tone="amber" /><FindingList title="Changed" findings={result.changed.map((entry) => entry.after)} tone="amber" /></div>
     </>}
   </div>;
+}
+
+function VerdictPill({ verdict }: { verdict: ComparisonResult['verdict'] }) {
+  const labels: Record<ComparisonResult['verdict'], string> = {
+    clean: 'Clean — no findings',
+    unchanged: 'Unchanged',
+    better: 'Better — findings fixed',
+    worse: 'Worse — new breaks appeared',
+    churn: 'Churn — findings changed',
+  };
+  const colors: Record<ComparisonResult['verdict'], string> = {
+    clean: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+    unchanged: 'border-slate-200 bg-slate-50 text-slate-700',
+    better: 'border-teal-200 bg-teal-50 text-teal-800',
+    worse: 'border-red-200 bg-red-50 text-red-800',
+    churn: 'border-amber-200 bg-amber-50 text-amber-800',
+  };
+  return <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${colors[verdict]}`}>{labels[verdict]}</span>;
+}
+
+function MetricDeltaCard({ label, value }: { label: string; value: ComparisonResult['metrics'][keyof ComparisonResult['metrics']] }) {
+  const color = value.direction === 'up' ? 'text-teal-800' : value.direction === 'down' ? 'text-red-700' : 'text-slate-600';
+  const delta = `${value.delta > 0 ? '+' : ''}${value.delta}`;
+  const percent = value.percentChange === null ? '' : ` (${value.percentChange > 0 ? '+' : ''}${value.percentChange}%)`;
+  return <div className="border border-slate-200 bg-slate-50 p-3"><p className="text-xs font-semibold uppercase text-slate-500">{label}</p><p className="mt-1 text-sm tabular-nums">{value.from} → {value.to}</p><p className={`mt-1 text-xs font-semibold tabular-nums ${color}`}>{delta}{percent}</p></div>;
 }
 
 function FindingList({ title, findings, tone }: { title: string; findings: ReconciliationFinding[]; tone: 'red' | 'teal' | 'amber' }) {
@@ -875,9 +1218,9 @@ function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: s
 }
 
 function StatusPill({ value }: { value: string }) {
-  const className = value === 'active' || value === 'completed' || value === 'resolved' ? 'border-teal-200 bg-teal-50 text-teal-800'
+  const className = value === 'active' || value === 'completed' || value === 'resolved' || value === 'succeeded' ? 'border-teal-200 bg-teal-50 text-teal-800'
     : value === 'failed' || value === 'open' ? 'border-red-200 bg-red-50 text-red-800'
-    : value === 'investigating' || value === 'acknowledged' || value === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800'
+    : value === 'investigating' || value === 'acknowledged' || value === 'running' || value === 'queued' ? 'border-amber-200 bg-amber-50 text-amber-800'
     : 'border-slate-200 bg-slate-50 text-slate-700';
   return <span className={`inline-flex border px-2 py-1 text-xs capitalize ${className}`}>{value.replaceAll('_', ' ')}</span>;
 }
