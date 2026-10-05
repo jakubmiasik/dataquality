@@ -1030,7 +1030,7 @@ function RulesPanel({
   </div>;
 }
 
-function RuleEditor({
+export function RuleEditor({
   draft, sources, objectsForSource, busy, onDraft, onSelectSource, onUpdateField, onAddField, onRemoveField, onSave, onCancel, onRegisterSource,
 }: {
   draft: RuleDraft;
@@ -1073,7 +1073,7 @@ function RuleEditor({
       <div className="border-t border-slate-200 pt-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-semibold">Values to compare</h4><p className="mt-1 text-xs text-slate-500">Operands may be columns, SQL expressions, fixed values, or aggregates.</p></div><button type="button" onClick={onAddField} className={secondaryButton}>Add value</button></div>
         <div className="space-y-3">
-          {draft.compareFields.map((field, index) => <div key={`${index}-${field.label}`} className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
+          {draft.compareFields.map((field, index) => <div key={index} className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
             <div className="mb-3 grid gap-3 md:grid-cols-[minmax(130px,1fr)_150px_150px_120px_auto]">
               <div><label className={labelClass}>Label</label><input className={input} value={field.label} onChange={(event) => onUpdateField(index, (current) => ({ ...current, label: event.target.value }))} /></div>
               <div><label className={labelClass}>Value type</label><select className={input} value={field.type} onChange={(event) => onUpdateField(index, (current) => ({ ...current, type: event.target.value as CompareField['type'] }))}><option value="string">Text</option><option value="number">Number</option><option value="date">Date</option><option value="boolean">Boolean</option></select></div>

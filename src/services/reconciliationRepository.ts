@@ -99,6 +99,29 @@ async function fetchAll<T>(build: () => PagedQuery<T>): Promise<T[]> {
 }
 
 /**
+ * `findById` asks DAB for the primary key alone, so every other column comes back
+ * undefined. Any read that inspects more than the id must name its columns.
+ */
+async function fetchOne<T>(build: () => PagedQuery<T>): Promise<T | null> {
+  const [record] = await fetchAll(build);
+  return record ?? null;
+}
+
+/** Every rule column, for reads whose result is snapshotted into a version row. */
+const ruleColumns = [
+  'id', 'name', 'description', 'businessArea', 'owner', 'priority', 'status', 'version',
+  'sourceAId', 'sourceBId', 'datasetA', 'datasetB', 'keyFieldA', 'keyFieldB', 'ruleGroup',
+  'duplicateHandling', 'incompleteKeyHandling', 'rowLimit', 'enabled',
+  'createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'user_id',
+] as const;
+
+/** Every column `nextOccurrence` needs to recompute a schedule's next slot. */
+const scheduleColumns = [
+  'id', 'rule_id', 'ruleName', 'enabled', 'cadence', 'intervalCount', 'hourUtc', 'minuteUtc',
+  'dayOfWeek', 'nextDueAt', 'lastTriggeredAt', 'lastRunId', 'lastStatus', 'lastError', 'user_id',
+] as const;
+
+/**
  * Rayfin stores these columns as NVARCHAR with a hard cap, so an oversized
  * payload would be rejected or silently truncated. Replace it with a marker
  * that still records why the detail is unavailable.
@@ -258,7 +281,8 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
   const client = getRayfinClient();
   const now = new Date();
   const current = draft.id
-    ? await client.data.ReconciliationRule.findById(draft.id)
+    ? await fetchOne(() => client.data.ReconciliationRule.select(['id', 'status', 'version', 'user_id'])
+      .where({ id: { eq: draft.id! } }).orderBy({ id: 'asc' }).first(1))
     : null;
   if (draft.id && !current) throw new Error('Rule not found.');
   const version = current ? current.version + 1 : 1;
@@ -322,7 +346,8 @@ export async function saveRule(draft: RuleDraft, userId: string, actor: string, 
 
 export async function setRuleEnabled(rule: StoredRule, compareFields: CompareField[], enabled: boolean, userId: string, actor: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationRule.findById(rule.id);
+  const current = await fetchOne(() => client.data.ReconciliationRule.select(ruleColumns)
+    .where({ id: { eq: rule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Rule not found.');
   if (enabled) {
     if (!current.sourceAId || !current.sourceBId || !current.datasetA || !current.datasetB || !current.keyFieldA || !current.keyFieldB) {
@@ -351,7 +376,8 @@ export async function setRuleEnabled(rule: StoredRule, compareFields: CompareFie
 /** Moves a rule out of service without deleting its history. */
 export async function retireRule(rule: StoredRule, compareFields: CompareField[], userId: string, actor: string, reason?: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationRule.findById(rule.id);
+  const current = await fetchOne(() => client.data.ReconciliationRule.select(ruleColumns)
+    .where({ id: { eq: rule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Rule not found.');
   if (current.status === 'retired') throw new Error('This rule is already retired.');
   const nextVersion = current.version + 1;
@@ -645,7 +671,8 @@ export async function loadRuleVersions(ruleId: string, _userId?: string) {
  */
 export async function deleteRun(runId: string): Promise<{ findingsDeleted: number; exceptionsRepointed: number }> {
   const client = getRayfinClient();
-  const run = await client.data.ReconciliationRun.findById(runId);
+  const run = await fetchOne(() => client.data.ReconciliationRun.select(['id', 'status'])
+    .where({ id: { eq: runId } }).orderBy({ id: 'asc' }).first(1));
   if (!run) throw new Error('Run not found.');
   if (run.status === 'running') throw new Error('Wait for this run to finish before deleting it.');
 
@@ -803,7 +830,8 @@ export async function deleteSchedule(scheduleId: string) {
 
 export async function setScheduleEnabled(scheduleId: string, enabled: boolean, actor: string) {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationSchedule.findById(scheduleId);
+  const current = await fetchOne(() => client.data.ReconciliationSchedule.select(scheduleColumns)
+    .where({ id: { eq: scheduleId } }).orderBy({ id: 'asc' }).first(1));
   if (!current) throw new Error('Schedule not found.');
   const now = new Date();
   await client.data.ReconciliationSchedule.update({ id: scheduleId }, {
@@ -832,7 +860,8 @@ export async function loadDueSchedules(now: Date): Promise<StoredSchedule[]> {
  */
 export async function claimSchedule(schedule: StoredSchedule, now: Date): Promise<boolean> {
   const client = getRayfinClient();
-  const current = await client.data.ReconciliationSchedule.findById(schedule.id);
+  const current = await fetchOne(() => client.data.ReconciliationSchedule.select(scheduleColumns)
+    .where({ id: { eq: schedule.id } }).orderBy({ id: 'asc' }).first(1));
   if (!current || !current.enabled) return false;
   if (new Date(current.nextDueAt).getTime() !== new Date(schedule.nextDueAt).getTime()) return false;
   await client.data.ReconciliationSchedule.update({ id: schedule.id }, {
