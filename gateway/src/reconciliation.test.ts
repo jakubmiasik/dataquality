@@ -5,6 +5,8 @@ import {
   bearerTokenFromHeader,
   tokensBelongToSamePrincipal,
   validateCatalogRequest,
+  describeConnectFailure,
+  isTransientConnectError,
   validateRequest,
 } from './reconciliation';
 
@@ -71,4 +73,20 @@ test('gateway requires a bearer token and binds SQL and Fabric tokens to the sam
   assert.equal(tokensBelongToSamePrincipal(token({ oid: 'user-a', tid: 'tenant' }), token({ oid: 'user-a', tid: 'tenant' })), true);
   assert.equal(tokensBelongToSamePrincipal(token({ oid: 'user-a', tid: 'tenant' }), token({ oid: 'user-b', tid: 'tenant' })), false);
   assert.equal(tokensBelongToSamePrincipal(token({ oid: 'user-a', tid: 'tenant' }), token({ oid: 'user-a', tid: 'other' })), false);
+});
+test('transient SQL connect failures are recognised and explained as connectivity, not permissions', () => {
+  assert.equal(isTransientConnectError(new Error('Failed to connect to host:1433 in 15000ms')), true);
+  assert.equal(isTransientConnectError(Object.assign(new Error('boom'), { code: 'ESOCKET' })), true);
+  assert.equal(isTransientConnectError(new Error('Login failed for user')), false);
+
+  const source = { workspaceId: 'w', itemId: 'i', itemType: 'Warehouse' as const, connectionString: 'abc.datawarehouse.fabric.microsoft.com', database: 'Source' };
+  const described = describeConnectFailure(source, new Error('Failed to connect to abc:1433 in 15000ms'), 3);
+  assert.match(described.message, /Could not reach the SQL endpoint for "Source"/);
+  assert.match(described.message, /after 3 attempt\(s\)/);
+  assert.match(described.message, /rather than a permissions one/);
+  assert.match(described.message, /paused/);
+
+  // A genuine authorization error must be passed through untouched.
+  const authError = new Error('Login failed for user');
+  assert.equal(describeConnectFailure(source, authError, 3), authError);
 });
