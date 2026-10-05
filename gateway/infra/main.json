@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "10819739439524685660"
+      "templateHash": "13469854992754379545"
     }
   },
   "parameters": {
@@ -1329,7 +1329,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "2338344382985942048"
+              "templateHash": "16846623835853513574"
             }
           },
           "parameters": {
@@ -6920,6 +6920,10 @@
             "SERVICE_API_NAME": {
               "type": "string",
               "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-flex-consumption', parameters('serviceName'))), '2025-04-01').outputs.name.value]"
+            },
+            "SERVICE_API_URI": {
+              "type": "string",
+              "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', format('{0}-flex-consumption', parameters('serviceName'))), '2025-04-01').outputs.defaultHostname.value)]"
             },
             "SERVICE_API_IDENTITY_PRINCIPAL_ID": {
               "type": "string",
@@ -29106,6 +29110,13 @@
     "AZURE_FUNCTION_NAME": {
       "type": "string",
       "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, if(not(empty(parameters('resourceGroupName'))), parameters('resourceGroupName'), format('{0}{1}', variables('abbrs').resourcesResourceGroups, parameters('environmentName')))), 'Microsoft.Resources/deployments', 'api'), '2025-04-01').outputs.SERVICE_API_NAME.value]"
+    },
+    "RECONCILIATION_GATEWAY_URL": {
+      "type": "string",
+      "metadata": {
+        "description": "Origin of the deployed gateway. Paste this into the \"Reconciliation gateway URL\" field on the app's Configuration tab."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, if(not(empty(parameters('resourceGroupName'))), parameters('resourceGroupName'), format('{0}{1}', variables('abbrs').resourcesResourceGroups, parameters('environmentName')))), 'Microsoft.Resources/deployments', 'api'), '2025-04-01').outputs.SERVICE_API_URI.value]"
     }
   }
 }

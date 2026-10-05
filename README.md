@@ -67,13 +67,24 @@ Open [http://localhost:5173](http://localhost:5173). The Vite proxy forwards
 │       ├── RayfinAuthService.ts   # Production impl (Fabric brokered auth)
 │       ├── rayfinClient.ts        # Typed Rayfin client singleton
 │       ├── appSettings.ts         # Runtime config (Entra IDs, gateway URL)
-│       ├── reconciliationEngine.ts     # Pure comparison engine (shared with the gateway)
+│       ├── reconciliationEngine.ts     # Re-export of gateway/src/reconciliationEngine.ts
 │       ├── reconciliationRepository.ts # Rayfin persistence
 │       ├── reconciliationSchedule.ts   # Cadence maths
 │       ├── reconciliationScheduler.ts  # Due-schedule sweep
 │       └── bootstrap.ts           # Reads env, picks the right auth service
+├── gateway/                # Azure Functions SQL gateway (deployed with azd)
+│   ├── infra/              # Bicep for the Function App, storage, and monitoring
+│   └── src/
+│       ├── reconciliationEngine.ts  # Pure comparison engine (single source of truth)
+│       ├── reconciliation.ts        # Request validation + bounded SQL execution
+│       └── functions/               # HTTP triggers
 └── package.json
 ```
+
+The comparison engine lives under `gateway/` and the app re-exports it. azd
+uploads only the `gateway` folder when it deploys, so anything the Function App
+imports has to live inside that folder — keeping the engine there lets the
+gateway build standalone while both sides still share one implementation.
 
 ## Data model and access
 
@@ -148,12 +159,21 @@ call the gateway. The Fabric-hosted app is cross-origin, so its origin must be
 listed or every call fails preflight. The deployment wires this into the Function
 App's CORS settings, so no manual portal step is needed.
 
-Note the Function App's HTTPS origin from the `azd up` output.
+Note the Function App's HTTPS origin from the `azd up` output. It is also
+written to the azd environment as `RECONCILIATION_GATEWAY_URL`, so you can read
+it back at any time:
+
+```bash
+azd env get-value RECONCILIATION_GATEWAY_URL
+# https://<function-app>.azurewebsites.net
+```
 
 ### 2. Point the app at the gateway
 
 Enter the Function App origin in the app's **Configuration** tab, or set
 `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` as the fallback.
+
+Use the origin only — the app appends `/api/reconciliation/...` itself.
 
 ### 3. Apply the data schema
 
@@ -174,6 +194,8 @@ npm run rayfin:up
 
 Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
 redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
+The **Configuration** tab prints the exact redirect URI for the origin you are
+currently on, with a copy button, so you can paste it straight into Entra.
 
 ### 5. Continuous integration
 
@@ -192,6 +214,30 @@ everyone else in the workspace.
 **Configuration says it saved to this browser only.** The `AppSetting` table is
 missing. Run `npx rayfin up db apply` to create it, then save again to share the
 values with the workspace.
+
+**Checking the gateway is reachable.** An unauthenticated POST should return a
+`401` from the gateway's own auth guard. Anything else (a timeout, a 404, or an
+Azure error page) means the URL is wrong or the Function App is not running:
+
+```bash
+curl -i -X POST -H 'content-type: application/json' -d '{}' \
+  https://<function-app>.azurewebsites.net/api/reconciliation/execute
+# HTTP/1.1 401 … {"error":"A signed-in Fabric user is required."}
+```
+
+**Sign-in fails with `AADSTS50011` (redirect URI mismatch).** The app always
+requests `<current origin>/auth-redirect.html`, and that exact value has to be
+registered on the Entra app as a **Single-page application** redirect URI. Each
+origin needs its own entry, so a Fabric deployment does not inherit the local
+`http://localhost:5173/auth-redirect.html` one. Open the **Configuration** tab to
+copy the URI the current origin uses, then add it under *Authentication → Single-page
+application* on the app registration. Registering it as *Web* instead of *SPA*
+produces the same error, because browser-based auth-code flows require the SPA
+platform.
+
+**Browser calls to the gateway fail CORS preflight.** The app's origin is not in
+the Function App's allowed origins. Re-run `azd env set CORS_ALLOWED_ORIGINS …`
+followed by `azd up` from `gateway/`.
 
 ### Hardening before production
 

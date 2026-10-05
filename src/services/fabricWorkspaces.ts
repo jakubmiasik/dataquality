@@ -10,7 +10,7 @@ const FABRIC_SCOPES = [
 ];
 const SQL_SCOPES = ['https://database.windows.net//user_impersonation'];
 
-function getRedirectUri() {
+export function getRedirectUri() {
   return `${window.location.origin}/auth-redirect.html`;
 }
 

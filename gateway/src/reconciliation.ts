@@ -1,6 +1,6 @@
 import sql from 'mssql';
 
-import type { ReconciliationRule } from '../../src/services/reconciliationEngine.js' with { 'resolution-mode': 'import' };
+import type { ReconciliationRule } from './reconciliationEngine.js';
 
 export interface FabricSourceReference {
   workspaceId: string;
@@ -56,7 +56,7 @@ export async function validateRequest(value: unknown): Promise<{ request?: Recon
   if (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000) {
     return { error: 'rowLimit must be between 1 and 10000.' };
   }
-  const engine = await import('../../src/services/reconciliationEngine.js');
+  const engine = await import('./reconciliationEngine.js');
   const problems = engine.validateCompareFields(rule.compareFields ?? []);
   if (problems.length) return { error: problems.join(' ') };
   try { engine.planRule(rule); }
@@ -162,7 +162,7 @@ export async function executeReconciliation(request: ReconciliationExecutionRequ
     resolveSource(request.sources.a, bearerToken),
     resolveSource(request.sources.b, bearerToken),
   ]);
-  const engine = await import('../../src/services/reconciliationEngine.js');
+  const engine = await import('./reconciliationEngine.js');
   const plan = engine.planRule(request.rule);
   const [rowsA, rowsB] = await Promise.all([
     withSqlPool(sourceA, sqlAccessToken, async (pool) => (await pool.request().query(engine.buildSelectSql({
