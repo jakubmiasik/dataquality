@@ -154,6 +154,38 @@ npm run rayfin:up
 Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
 redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
 
+### 5. Continuous deployment
+
+`.github/workflows/deploy-fabric.yml` builds, lints and tests on every pull
+request, then deploys to Fabric when a PR merges to `main`. Deploys run in the
+`fabric` GitHub environment, so attach required reviewers there if you want a
+manual approval gate.
+
+The workflow authenticates with `rayfin login --service-principal`, so create an
+Entra app registration, give it access to the target Fabric workspace, and
+configure:
+
+| Kind | Name | Value |
+|------|------|-------|
+| Secret | `RAYFIN_CLIENT_ID` | Service principal application (client) ID |
+| Secret | `RAYFIN_CLIENT_SECRET` | Service principal client secret |
+| Secret | `RAYFIN_TENANT_ID` | Entra tenant ID |
+| Secret | `RAYFIN_DEPLOYMENTS_JSON` | Contents of `rayfin/.deployments.json` after a successful local `rayfin up` |
+| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` | SPA app registration client ID |
+| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID` | SPA app registration tenant ID |
+| Variable | `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` | Deployed gateway HTTPS origin |
+
+`RAYFIN_DEPLOYMENTS_JSON` matters: `rayfin/.deployments.json` is gitignored, and
+without it `rayfin up` has no record of the existing AppBackend and provisions a
+new one on every run. Deploy once locally, then copy that file into the secret.
+
+`rayfin up` applies the database schema as part of the deploy. It refuses
+destructive migrations rather than dropping data, so a schema change that would
+lose data fails the job and needs a deliberate local `rayfin up db apply --force`.
+
+The Azure gateway is not deployed by this workflow; run `azd up` from `gateway/`
+when it changes.
+
 ### Hardening before production
 
 - `services.auth.password` in `rayfin/rayfin.yml` is enabled for local dev. Since

@@ -1,0 +1,117 @@
+name: Deploy to Fabric
+
+# Pull requests run the checks only. Merging to main runs the same checks and
+# then deploys, so main is always the deployed revision.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two deploys touch the same Fabric item at once. PR runs are
+  # grouped per branch so a new push supersedes an in-flight check run.
+  group: fabric-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npx tsc -b --force
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Gateway build and tests
+        run: npm ci && npm test
+        working-directory: gateway
+
+  deploy:
+    name: Deploy to Fabric
+    needs: verify
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Attach required reviewers or branch restrictions to this environment to
+    # gate production deploys.
+    environment: fabric
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Write Rayfin environment
+        env:
+          FABRIC_ENTRA_CLIENT_ID: ${{ vars.RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID }}
+          FABRIC_ENTRA_TENANT_ID: ${{ vars.RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID }}
+          GATEWAY_URL: ${{ vars.RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL }}
+        run: |
+          set -euo pipefail
+          # These are public SPA identifiers and the gateway origin, not secrets.
+          # rayfin up merges its own RAYFIN_PUBLIC_* values into this file and
+          # projects them all into .env.local for the Vite build.
+          {
+            echo "RAYFIN_PUBLIC_SERVICE_MODE=rayfin"
+            echo "RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID=${FABRIC_ENTRA_CLIENT_ID}"
+            echo "RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID=${FABRIC_ENTRA_TENANT_ID}"
+            echo "RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL=${GATEWAY_URL}"
+          } > rayfin/.env
+
+      - name: Restore deployment registry
+        env:
+          DEPLOYMENTS_JSON: ${{ secrets.RAYFIN_DEPLOYMENTS_JSON }}
+        run: |
+          set -euo pipefail
+          # Without this registry rayfin up has no record of the existing
+          # AppBackend and would provision a second one on every run.
+          if [ -z "${DEPLOYMENTS_JSON}" ]; then
+            echo "::error::RAYFIN_DEPLOYMENTS_JSON is not set. Copy rayfin/.deployments.json from a successful local deploy into that secret." >&2
+            exit 1
+          fi
+          printf '%s' "${DEPLOYMENTS_JSON}" > rayfin/.deployments.json
+          node -e "JSON.parse(require('fs').readFileSync('rayfin/.deployments.json','utf8'))"
+
+      - name: Sign in to Rayfin
+        env:
+          CLIENT_ID: ${{ secrets.RAYFIN_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.RAYFIN_CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.RAYFIN_TENANT_ID }}
+        run: |
+          set -euo pipefail
+          npx rayfin login --service-principal \
+            --client-id "${CLIENT_ID}" \
+            --client-secret "${CLIENT_SECRET}" \
+            --tenant "${TENANT_ID}"
+
+      - name: Deploy
+        run: npx rayfin up
+
+      - name: Report deployment
+        run: npx rayfin up status
+
+      - name: Sign out
+        if: always()
+        run: npx rayfin logout || true
