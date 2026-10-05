@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
+import { ThemeToggle } from '@/components/ThemeToggle';
 import { useAuth } from '@/hooks/AuthContext';
 import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
 import { describeBusy } from '@/services/busyMessages';
@@ -98,9 +99,9 @@ const severities: StoredException['severity'][] = ['high', 'medium', 'low'];
 const aggregateFunctions: Array<NonNullable<Operand['fn']>> = ['sum', 'count', 'countDistinct', 'avg', 'min', 'max'];
 const supportedTypes = ['Lakehouse', 'Warehouse'];
 const button = 'inline-flex min-h-9 items-center justify-center gap-2 rounded-lg border px-3.5 py-1.5 text-sm font-medium transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 disabled:cursor-not-allowed disabled:opacity-50';
-const primaryButton = `${button} border-transparent bg-gradient-to-b from-brand-500 to-brand-600 text-white shadow-sm shadow-brand-600/25 hover:from-brand-600 hover:to-brand-700 hover:shadow-md hover:shadow-brand-600/30 disabled:shadow-none`;
+const primaryButton = `${button} border-transparent bg-gradient-to-b from-brand-500 to-brand-600 text-oncolor shadow-sm shadow-brand-600/25 hover:from-brand-600 hover:to-brand-700 hover:shadow-md hover:shadow-brand-600/30 disabled:shadow-none`;
 const secondaryButton = `${button} border-slate-200 bg-white text-slate-700 shadow-sm hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900`;
-const dangerButton = `${button} border-transparent bg-rose-600 text-white shadow-sm shadow-rose-600/20 hover:bg-rose-700`;
+const dangerButton = `${button} border-transparent bg-rose-600 text-oncolor shadow-sm shadow-rose-600/20 hover:bg-rose-700`;
 /* Colour is kept out of the base so the invalid variant does not rely on
    Tailwind source order to beat the default border and ring utilities. */
 const inputBase = 'min-h-9 w-full rounded-lg border bg-white px-3 py-1.5 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:ring-4';
@@ -834,8 +835,8 @@ export function ReconciliationPage() {
       <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/85 backdrop-blur-md">
         <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-7">
           <div className="flex items-center gap-3">
-            <span aria-hidden="true" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 shadow-md shadow-brand-600/30">
-              <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6 text-white" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <span aria-hidden="true" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-600 shadow-md shadow-brand-600/30">
+              <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6 text-oncolor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M4 7h11l-2.5-2.5" /><path d="M20 17H9l2.5 2.5" /><circle cx="18" cy="7" r="2.5" /><circle cx="6" cy="17" r="2.5" />
               </svg>
             </span>
@@ -847,6 +848,7 @@ export function ReconciliationPage() {
           <div className="flex items-center gap-3">
             <div className="hidden text-right sm:block"><p className="text-sm font-semibold text-slate-800">{userName}</p><p className="text-xs text-slate-500">Workspace-shared controls and results</p></div>
             <span aria-hidden="true" className="hidden h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-brand-100 to-brand-200 text-sm font-bold text-brand-700 sm:flex">{userName.trim().charAt(0).toUpperCase()}</span>
+            <ThemeToggle />
             <button type="button" onClick={() => void signOut()} className={secondaryButton}>Sign out</button>
           </div>
         </div>

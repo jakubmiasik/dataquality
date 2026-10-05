@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import { ThemeToggle } from '@/components/ThemeToggle';
 import { useAuth } from '@/hooks/AuthContext';
 
 const msLogo = (
@@ -47,12 +48,14 @@ export function AuthPage() {
       <div className="pointer-events-none absolute -top-24 -right-24 h-96 w-96 rounded-full bg-brand-200/40 blur-3xl" />
       <div className="pointer-events-none absolute -bottom-32 -left-32 h-[500px] w-[500px] rounded-full bg-teal-200/30 blur-3xl" />
 
+      <div className="relative flex justify-end p-4"><ThemeToggle /></div>
+
       <div className="relative flex flex-1 items-center justify-center p-4">
         <div className="w-full max-w-sm">
           <div className="rounded-2xl border border-white/70 bg-white/85 p-8 shadow-xl shadow-slate-900/5 backdrop-blur-md">
             <div className="mb-8 text-center">
-              <span aria-hidden="true" className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 shadow-lg shadow-brand-600/30">
-                <svg viewBox="0 0 24 24" fill="none" className="h-7 w-7 text-white" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <span aria-hidden="true" className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-600 shadow-lg shadow-brand-600/30">
+                <svg viewBox="0 0 24 24" fill="none" className="h-7 w-7 text-oncolor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M4 7h11l-2.5-2.5" /><path d="M20 17H9l2.5 2.5" /><circle cx="18" cy="7" r="2.5" /><circle cx="6" cy="17" r="2.5" />
                 </svg>
               </span>
@@ -66,7 +69,7 @@ export function AuthPage() {
               type="button"
               onClick={handleSignIn}
               disabled={isLoading}
-              className="flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-brand-600/25 transition-all hover:from-brand-700 hover:to-brand-600 hover:shadow-xl hover:shadow-brand-600/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 disabled:opacity-50 disabled:shadow-none"
+              className="flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 px-4 py-3 text-sm font-semibold text-oncolor shadow-lg shadow-brand-600/25 transition-all hover:from-brand-700 hover:to-brand-600 hover:shadow-xl hover:shadow-brand-600/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 disabled:opacity-50 disabled:shadow-none"
             >
               {msLogo}
               {buttonLabel}
