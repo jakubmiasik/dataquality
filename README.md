@@ -51,15 +51,47 @@ Open [http://localhost:5173](http://localhost:5173). The Vite proxy forwards
 │   │   └── AuthPage.tsx    # Sign-in UI
 │   ├── pages/
 │   │   ├── HomePage.tsx    # Authenticated app route
-│   │   └── ReconciliationPage.tsx # Inventory, rules, runs, findings
+│   │   └── ReconciliationPage.tsx # Inventory, rules, runs, findings, schedules
+│   ├── hooks/
+│   │   └── useScheduleSweeper.ts  # Browser-driven scheduled runs
 │   └── services/
 │       ├── IAuthService.ts        # Auth service contract + AuthUser type
 │       ├── MockAuthService.ts     # Local-dev impl (email/password)
 │       ├── RayfinAuthService.ts   # Production impl (Fabric brokered auth)
 │       ├── rayfinClient.ts        # Typed Rayfin client singleton
+│       ├── reconciliationEngine.ts     # Pure comparison engine (shared with the gateway)
+│       ├── reconciliationRepository.ts # Rayfin persistence
+│       ├── reconciliationSchedule.ts   # Cadence maths
+│       ├── reconciliationScheduler.ts  # Due-schedule sweep
 │       └── bootstrap.ts           # Reads env, picks the right auth service
 └── package.json
 ```
+
+## Data model and access
+
+Rules, runs, findings, exceptions, audit events, and schedules are
+**workspace-shared**: every signed-in user sees and can act on all of them, which
+matches the governance tool this app replaces. Records still carry the creating
+user so history and audit events stay attributable.
+
+Rayfin caps every `@text()` column at 4000 characters, so large payloads
+(row snapshots, summaries, comments) are clamped on write rather than rejected.
+
+## Scheduling
+
+Rules can be scheduled hourly, daily, or weekly from the **Schedules** tab. Times
+are UTC.
+
+Rayfin only supports the `anonymous` and `authenticated` roles, and an
+authenticated session can only be created by an interactive Entra/Fabric sign-in.
+There is therefore no supported way for a background service to read schedules or
+write run outcomes. Scheduled runs are instead swept by the app itself: every
+signed-in browser with the app open checks once a minute for due schedules and
+runs them. Claiming a schedule advances its next due time before the run starts,
+so several open tabs cannot run the same slot twice.
+
+In practice this means **a schedule only fires while at least one person has the
+app open**. A missed slot runs on the next sweep rather than being skipped.
 
 ## Scripts
 
@@ -78,6 +110,57 @@ Open [http://localhost:5173](http://localhost:5173). The Vite proxy forwards
 For local execution, install Azure Functions Core Tools and run the Functions
 host from `gateway/` as shown above. The gateway resolves source endpoints from
 Fabric REST APIs and uses the signed-in user's delegated SQL token; it does not
-need a SQL password or app secret. For a deployed gateway, set
-`RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` to its HTTPS origin
-and allow the Rayfin app origin in the Function App CORS settings.
+need a SQL password or app secret.
+
+## Deployment
+
+### 1. Deploy the Azure gateway
+
+```bash
+cd gateway
+azd env new <environment-name>
+azd env set CORS_ALLOWED_ORIGINS "https://app.fabric.microsoft.com"
+azd env set VNET_ENABLED false
+azd up
+```
+
+`CORS_ALLOWED_ORIGINS` is a comma-separated list of browser origins allowed to
+call the gateway. The Fabric-hosted app is cross-origin, so its origin must be
+listed or every call fails preflight. The deployment wires this into the Function
+App's CORS settings, so no manual portal step is needed.
+
+Note the Function App's HTTPS origin from the `azd up` output.
+
+### 2. Point the app at the gateway
+
+Set `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` to that origin.
+
+### 3. Apply the data schema
+
+```bash
+npx rayfin up db apply
+```
+
+Required after pulling these changes: it creates the `ReconciliationSchedule`
+table and adds the `caseInsensitive` and `trimValues` columns to the rule-field
+tables.
+
+### 4. Deploy the app to Fabric
+
+```bash
+npm run rayfin:up
+```
+
+Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
+redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
+
+### Hardening before production
+
+- `services.auth.password` in `rayfin/rayfin.yml` is enabled for local dev. Since
+  the data is workspace-shared, disable it in production so access is governed by
+  Entra/Fabric sign-in alone.
+- The gateway's HTTP functions use `authLevel: 'anonymous'` and decode, but do not
+  cryptographically verify, the delegated tokens they forward. Fabric REST and SQL
+  both verify the tokens themselves, so a forged token gains no data access, but
+  adding signature, issuer, audience, and expiry validation in the gateway is a
+  worthwhile defence-in-depth follow-up.
