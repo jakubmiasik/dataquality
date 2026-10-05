@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { StoredRun } from '@/services/reconciliationRepository';
-import { batchKeyOf, describeBatch, findBatch, groupRunsIntoBatches, shortBatchId } from '@/services/runBatches';
+import { batchKeyOf, batchLabel, describeBatch, findBatch, groupRunsIntoBatches, shortBatchId } from '@/services/runBatches';
 
 function run(overrides: Partial<StoredRun> & Pick<StoredRun, 'id'>): StoredRun {
   return {
@@ -97,13 +97,24 @@ describe('batch identifiers', () => {
   it('names a single-rule batch by its rule and a bulk batch by its size', () => {
     const format = () => 'May 1';
     const [single] = groupRunsIntoBatches([run({ id: 'a', batch_id: 'batch-1', ruleName: 'Ledger vs GL' })]);
-    expect(describeBatch(single, format)).toBe('Run batch1 · May 1 · Ledger vs GL');
+    expect(describeBatch(single, format)).toBe('Run #1 · May 1 · Ledger vs GL');
 
     const [bulk] = groupRunsIntoBatches([
       run({ id: 'a', batch_id: 'batch-2', rule_id: 'rule-a' }),
       run({ id: 'b', batch_id: 'batch-2', rule_id: 'rule-b' }),
     ]);
-    expect(describeBatch(bulk, format)).toBe('Run batch2 · May 1 · 2 rules');
+    expect(describeBatch(bulk, format)).toBe('Run #1 · May 1 · 2 rules');
+  });
+
+  it('numbers from the oldest run so a number never shifts as runs are added', () => {
+    const first = run({ id: 'a', batch_id: 'batch-1', startedAt: new Date('2024-05-01T10:00:00Z') });
+    const second = run({ id: 'b', batch_id: 'batch-2', startedAt: new Date('2024-05-02T10:00:00Z') });
+
+    expect(groupRunsIntoBatches([first]).map((batch) => [batch.id, batch.number])).toEqual([['batch-1', 1]]);
+
+    const both = groupRunsIntoBatches([second, first]);
+    expect(both.map((batch) => [batch.id, batch.number])).toEqual([['batch-2', 2], ['batch-1', 1]]);
+    expect(batchLabel(both[0])).toBe('Run #2');
   });
 
   it('returns null for an unknown batch', () => {
