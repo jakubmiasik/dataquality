@@ -13,6 +13,7 @@
     "dev": "rayfin dev",
     "dev:frontend": "vite",
     "build": "tsc -b && vite build",
+    "prebuild:fabric": "rayfin env --framework vite",
     "build:fabric": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
