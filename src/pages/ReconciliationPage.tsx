@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { useAuth } from '@/hooks/AuthContext';
 import { useScheduleSweeper } from '@/hooks/useScheduleSweeper';
+import { describeBusy } from '@/services/busyMessages';
 import {
   callReconciliationGateway,
   getRedirectUri,
@@ -24,6 +25,7 @@ import {
   findOrphans,
   loadExceptionEvents,
   loadReconciliationData,
+  loadRunExceptionIds,
   loadRuleFields,
   loadRuleVersions,
   comparePortfolio,
@@ -173,6 +175,21 @@ interface DialogRequest {
   resolve: (value: string | null) => void;
 }
 
+/**
+ * Every long action already sets `busyKey`; mapping it to prose lets one toast
+ * tell the user that work is in flight instead of leaving the page silent.
+ */
+export function ProgressToast({ message }: { message: string }) {
+  return (
+    <div role="status" aria-live="polite" className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
+      <div className="pointer-events-auto flex items-center gap-3 rounded-full border border-brand-200 bg-white/95 px-4 py-2.5 text-sm font-medium text-slate-700 shadow-lg shadow-slate-900/10 backdrop-blur">
+        <span aria-hidden="true" className="h-4 w-4 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
+        {message}
+      </div>
+    </div>
+  );
+}
+
 export function ReconciliationPage() {
   const { signOut, user } = useAuth();
   const userId = user?.id;
@@ -190,6 +207,7 @@ export function ReconciliationPage() {
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
   const [portfolio, setPortfolio] = useState<PortfolioComparison | null>(null);
   const [overviewRunId, setOverviewRunId] = useState('');
+  const [runMembership, setRunMembership] = useState<Record<string, string[]>>({});
   const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft | null>(null);
   const [orphanReport, setOrphanReport] = useState<OrphanReport | null>(null);
   const [selectedRuleIds, setSelectedRuleIds] = useState<string[]>([]);
@@ -207,6 +225,7 @@ export function ReconciliationPage() {
   const [loading, setLoading] = useState(false);
   const [registrationLoading, setRegistrationLoading] = useState(false);
   const [busyKey, setBusyKey] = useState('');
+  const busyMessage = describeBusy(busyKey) ?? (loading && data ? 'Refreshing reconciliation data...' : null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettingsState | null>(null);
@@ -281,6 +300,15 @@ export function ReconciliationPage() {
     },
   });
 
+  // `lastRunId` is rewritten whenever a later run sees the same exception again,
+  // so filtering on it silently emptied earlier runs. Findings record run
+  // membership permanently and are loaded on demand for the runs in view.
+  const runMembershipFor = useCallback((runId: string) => runMembership[runId] ?? null, [runMembership]);
+  const belongsToRun = useCallback((exception: StoredException, runId: string) => {
+    const members = runMembershipFor(runId);
+    return members ? members.includes(exception.id) : exception.lastRunId === runId;
+  }, [runMembershipFor]);
+
   const filteredExceptions = useMemo(() => exceptions.filter((exception) => {
     const rule = rules.find((entry) => entry.id === exception.rule_id);
     return (!exceptionFilter.status || exception.status === exceptionFilter.status)
@@ -288,9 +316,9 @@ export function ReconciliationPage() {
       && (!exceptionFilter.outcome || exception.outcome === exceptionFilter.outcome)
       && (!exceptionFilter.ruleId || exception.rule_id === exceptionFilter.ruleId)
       && (!exceptionFilter.ruleGroup || rule?.ruleGroup === exceptionFilter.ruleGroup)
-      && (!exceptionFilter.runId || exception.lastRunId === exceptionFilter.runId)
+      && (!exceptionFilter.runId || belongsToRun(exception, exceptionFilter.runId))
       && (!exceptionFilter.owner || (exception.owner ?? '').toLocaleLowerCase().includes(exceptionFilter.owner.toLocaleLowerCase()));
-  }), [exceptions, exceptionFilter, rules]);
+  }), [exceptions, exceptionFilter, rules, belongsToRun]);
 
   const selectedComparisonRuns = useMemo(() => runs.filter((run) =>
     run.status === 'completed' && (comparisonRuleId === ALL_RULES || run.rule_id === comparisonRuleId)
@@ -306,10 +334,25 @@ export function ReconciliationPage() {
     setExceptionFilter((current) => current.runId ? current : { ...current, runId: runs[0].id });
   }, [runs]);
 
+  const neededRunIds = useMemo(() => [overviewRun?.id, exceptionFilter.runId].filter((id): id is string => Boolean(id)), [overviewRun, exceptionFilter.runId]);
+  useEffect(() => {
+    const missing = neededRunIds.filter((id) => !(id in runMembership));
+    if (!missing.length || !userId) return;
+    let cancelled = false;
+    void Promise.all(missing.map(async (runId) => [runId, await loadRunExceptionIds(runId).catch(() => [])] as const))
+      .then((entries) => {
+        if (cancelled) return;
+        setRunMembership((current) => ({ ...current, ...Object.fromEntries(entries) }));
+      });
+    return () => { cancelled = true; };
+  }, [neededRunIds, runMembership, userId]);
+
   async function refreshData() {
     if (!user) return;
     setLoading(true);
     setError(null);
+    // A new run writes new findings, so cached run membership must be rebuilt.
+    setRunMembership({});
     try { setData(await loadReconciliationData(user.id)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to refresh reconciliation data.'); }
     finally { setLoading(false); }
@@ -835,7 +878,7 @@ export function ReconciliationPage() {
 
         {tab === 'overview' && data && <OverviewPanel
           rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
-          selectedRun={overviewRun} selectedRunId={overviewRunId} onSelectRun={setOverviewRunId}
+          selectedRun={overviewRun} selectedRunId={overviewRunId} isInRun={belongsToRun} onSelectRun={setOverviewRunId}
           onEditRule={(rule) => { setTab('rules'); void openEditRule(rule); }}
           onReviewExceptions={(patch) => { setExceptionFilter((current) => ({ ...current, severity: '', ruleId: '', ruleGroup: '', ...patch })); setTab('exceptions'); }}
           onNavigate={setTab} onFindOrphans={() => void checkOrphans()} onPurgeOrphans={() => void purgeOrphanRows()}
@@ -900,12 +943,13 @@ export function ReconciliationPage() {
         onClose={() => { setRegistrationOpen(false); setRegistrationSide(null); }}
       />}
       {dialog && <PromptDialog request={dialog} onResolve={closeDialog} />}
+      {busyMessage && <ProgressToast message={busyMessage} />}
     </div>
   );
 }
 
 function OverviewPanel({
-  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, selectedRunId, onSelectRun, onEditRule, onReviewExceptions, onNavigate, onFindOrphans, onPurgeOrphans,
+  rules, runs, openExceptions, orphanReport, busyKey, selectedRun, selectedRunId, isInRun, onSelectRun, onEditRule, onReviewExceptions, onNavigate, onFindOrphans, onPurgeOrphans,
 }: {
   rules: StoredRule[];
   runs: StoredRun[];
@@ -914,6 +958,7 @@ function OverviewPanel({
   busyKey: string;
   selectedRun: StoredRun | null;
   selectedRunId: string;
+  isInRun: (exception: StoredException, runId: string) => boolean;
   onSelectRun: (id: string) => void;
   onEditRule: (rule: StoredRule) => void;
   onReviewExceptions: (patch: Partial<ExceptionFilter>) => void;
@@ -925,8 +970,8 @@ function OverviewPanel({
   // Everything derived from exceptions narrows to the chosen run so the page
   // reads as a report of that run rather than an all-time total.
   const scopedExceptions = useMemo(
-    () => (scopedToRun && selectedRun ? openExceptions.filter((exception) => exception.lastRunId === selectedRun.id) : openExceptions),
-    [openExceptions, scopedToRun, selectedRun],
+    () => (scopedToRun && selectedRun ? openExceptions.filter((exception) => isInRun(exception, selectedRun.id)) : openExceptions),
+    [openExceptions, scopedToRun, selectedRun, isInRun],
   );
   const scopeLabel = scopedToRun && selectedRun ? `${selectedRun.ruleName} · ${formatDate(selectedRun.startedAt)}` : 'All runs';
   const recentRuns = runs.slice(0, 8);
@@ -952,19 +997,25 @@ function OverviewPanel({
   });
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-        <span className="font-semibold uppercase tracking-wide">Showing</span>
-        <span className="rounded-full border border-brand-200 bg-brand-50 px-2.5 py-1 font-semibold text-brand-800">{scopeLabel}</span>
-        {scopedToRun && <button type="button" onClick={() => onSelectRun(ALL_RUNS)} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Show all runs</button>}
-      </div>
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric label="Active rules" value={rules.filter((rule) => rule.enabled).length} accent="brand" onClick={() => onNavigate('rules')} />
-        <Metric label="Draft rules" value={rules.filter((rule) => rule.status === 'draft').length} accent="slate" onClick={() => onNavigate('rules')} />
-        <Metric label={scopedToRun ? 'Open exceptions in run' : 'Open exceptions'} value={scopedExceptions.length} accent="rose" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} />
-        <Metric label="Completed runs" value={runs.filter((run) => run.status === 'completed').length} accent="teal" onClick={() => onNavigate('runs')} />
-      </div>
       <section className={card}>
-        <SectionTitle title="Run summary" subtitle="Showing the most recent run until you choose another." action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Run history</button>} />
+        <SectionTitle title="General info" subtitle="All-time totals across every rule and run." />
+        <div className="grid gap-4 p-4 sm:grid-cols-2 xl:grid-cols-5">
+          <Metric label="Total runs" value={runs.length} accent="brand" onClick={() => onNavigate('runs')} />
+          <Metric label="Completed runs" value={runs.filter((run) => run.status === 'completed').length} accent="teal" onClick={() => onNavigate('runs')} />
+          <Metric label="Failed runs" value={runs.filter((run) => run.status === 'failed').length} accent="amber" onClick={() => onNavigate('runs')} />
+          <Metric label="Active rules" value={rules.filter((rule) => rule.enabled).length} accent="brand" onClick={() => onNavigate('rules')} />
+          <Metric label="Draft rules" value={rules.filter((rule) => rule.status === 'draft').length} accent="slate" onClick={() => onNavigate('rules')} />
+        </div>
+        <p className="border-t border-slate-100 px-4 py-3 text-xs text-slate-500">{rules.length} rule{rules.length === 1 ? '' : 's'} defined · {openExceptions.length} open exception{openExceptions.length === 1 ? '' : 's'} across all runs.</p>
+      </section>
+      <section className={card}>
+        <SectionTitle title="Last runs" action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">View history</button>} />
+        {recentRuns.length ? <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
+          {recentRuns.map((run) => <tr key={run.id} className={run.id === selectedRun?.id && scopedToRun ? 'bg-brand-50/60' : undefined}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><button type="button" onClick={() => onSelectRun(run.id)} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Inspect</button></td></tr>)}
+        </tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
+      </section>
+      <section className={card}>
+        <SectionTitle title="Run detail" subtitle="Summary, rule coverage and priority work for the selected run." action={<div className="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span className="rounded-full border border-brand-200 bg-brand-50 px-2.5 py-1 font-semibold text-brand-800">{scopeLabel}</span>{scopedToRun && <button type="button" onClick={() => onSelectRun(ALL_RUNS)} className="font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Show all runs</button>}</div>} />
         <div className="space-y-4 p-4">
           <div className="max-w-xl"><label className={labelClass} htmlFor="overview-run">Run</label>
             <select id="overview-run" className={input} value={scopedToRun ? selectedRun?.id ?? '' : ALL_RUNS} onChange={(event) => onSelectRun(event.target.value)} disabled={!runs.length}>
@@ -974,54 +1025,58 @@ function OverviewPanel({
               ] : <option value="">No runs recorded</option>}
             </select>
           </div>
-          {selectedRun ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <Metric label="Rows read (A)" value={selectedRun.recordsA} accent="slate" onClick={noop} />
-            <Metric label="Rows read (B)" value={selectedRun.recordsB} accent="slate" onClick={noop} />
-            <Metric label="Matched" value={selectedRun.matched} accent="teal" onClick={noop} />
-            <Metric label="Findings" value={selectedRun.exceptionCount} accent="rose" onClick={noop} />
-          </div> : runs.length ? <EmptyMessage>Choose a single run to see its totals.</EmptyMessage> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
-          {selectedRun && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Status <StatusPill value={selectedRun.status} /> <span>started {formatDate(selectedRun.startedAt)} · completed {formatDate(selectedRun.completedAt)}{selectedRun.errorMessage ? ` · ${selectedRun.errorMessage}` : ''}</span></p>}
-        </div>
-      </section>
-      <section className={card}>
-        <SectionTitle title="Coverage by rule group" subtitle="Select a rule to open its definition." action={<button type="button" onClick={() => onNavigate('rules')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Manage rules</button>} />
-        {groupCounts.length ? <div className="grid divide-y divide-slate-100 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-3">
-          {groupCounts.map((group) => <div key={group.key} className="px-4 py-3">
-            <div className="flex items-start justify-between gap-4">
-              <p className="text-sm font-medium">{group.label}</p>
-              <div className="flex shrink-0 gap-5 text-right text-xs"><div><p className="font-semibold text-teal-800">{group.active}</p><p className="text-slate-500">enabled</p></div><div><p className="font-semibold text-rose-700">{group.exceptions}</p><p className="text-slate-500">open</p></div></div>
-            </div>
-            <ul className="mt-2 space-y-1">
-              {group.members.map((rule) => <li key={rule.id} className="flex items-center justify-between gap-2">
-                <button type="button" onClick={() => onEditRule(rule)} disabled={busyKey === `rule:${rule.id}`} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline disabled:opacity-50">{busyKey === `rule:${rule.id}` ? 'Opening...' : rule.name}</button>
-                <span className={`shrink-0 text-[11px] ${rule.enabled ? 'text-teal-700' : 'text-slate-400'}`}>{rule.enabled ? 'enabled' : rule.status}</span>
-              </li>)}
-            </ul>
-          </div>)}
-        </div> : <EmptyMessage>Rule coverage will appear here after you create rules.</EmptyMessage>}
-      </section>
-      <section className={card}>
-        <SectionTitle title="Recent runs" action={<button type="button" onClick={() => onNavigate('runs')} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">View history</button>} />
-        {recentRuns.length ? <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50/80 text-xs font-semibold uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-2.5">Rule</th><th className="px-4 py-2.5">Started</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Matched</th><th className="px-4 py-2.5 text-right">Findings</th><th className="px-4 py-2.5"></th></tr></thead><tbody className="divide-y divide-slate-100 [&>tr]:transition-colors [&>tr:hover]:bg-slate-50/70">
-          {recentRuns.map((run) => <tr key={run.id}><td className="px-4 py-3 font-medium">{run.ruleName}<span className="ml-2 text-xs text-slate-400">v{run.ruleVersion}</span></td><td className="px-4 py-3 text-slate-600">{formatDate(run.startedAt)}</td><td className="px-4 py-3"><StatusPill value={run.status} /></td><td className="px-4 py-3 text-right tabular-nums">{run.matched}</td><td className="px-4 py-3 text-right tabular-nums">{run.exceptionCount}</td><td className="px-4 py-3 text-right"><button type="button" onClick={() => onNavigate('runs')} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">History</button></td></tr>)}
-        </tbody></table></div> : <EmptyMessage>No runs have been recorded.</EmptyMessage>}
-      </section>
-      <section className={card}>
-        <SectionTitle title="Priority work" subtitle="Open exceptions grouped by importance, by rule." action={<button type="button" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} className="text-sm font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>} />
-        {scopedExceptions.length ? <div className="grid divide-y divide-slate-100 p-4 sm:grid-cols-3 sm:gap-4 sm:divide-y-0">
-          {priorityBySeverity.map((bucket) => <div key={bucket.severity} className="pt-3 first:pt-0 sm:pt-0">
+          <div className="space-y-3">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Run summary</h3>
+            {selectedRun ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+              <Metric label="Rows read (A)" value={selectedRun.recordsA} accent="slate" onClick={noop} />
+              <Metric label="Rows read (B)" value={selectedRun.recordsB} accent="slate" onClick={noop} />
+              <Metric label="Matched" value={selectedRun.matched} accent="teal" onClick={noop} />
+              <Metric label="Findings" value={selectedRun.exceptionCount} accent="rose" onClick={noop} />
+              <Metric label="Open exceptions" value={scopedExceptions.length} accent="rose" onClick={() => onReviewExceptions({ runId: selectedRun.id })} />
+            </div> : runs.length ? <EmptyMessage>Choose a single run to see its totals.</EmptyMessage> : <EmptyMessage>Run a rule to populate this summary.</EmptyMessage>}
+            {selectedRun && <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">Status <StatusPill value={selectedRun.status} /> <span>started {formatDate(selectedRun.startedAt)} · completed {formatDate(selectedRun.completedAt)}{selectedRun.errorMessage ? ` · ${selectedRun.errorMessage}` : ''}</span></p>}
+          </div>
+          <div className="space-y-3 border-t border-slate-100 pt-4">
             <div className="flex items-center justify-between gap-3">
-              <SeverityPill value={bucket.severity} />
-              <span className="text-sm font-semibold tabular-nums text-slate-700">{bucket.total}</span>
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Coverage by rule group</h3>
+              <button type="button" onClick={() => onNavigate('rules')} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Manage rules</button>
             </div>
-            {bucket.rules.length ? <ul className="mt-2 space-y-1">
-              {bucket.rules.map((entry) => <li key={entry.ruleId} className="flex items-center justify-between gap-2">
-                <button type="button" onClick={() => onReviewExceptions({ severity: bucket.severity, ruleId: entry.ruleId, runId: scopedToRun && selectedRun ? selectedRun.id : '' })} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{entry.name}</button>
-                <span className="shrink-0 text-xs tabular-nums text-slate-500">{entry.count}</span>
-              </li>)}
-            </ul> : <p className="mt-2 text-xs text-slate-400">Nothing at this level.</p>}
-          </div>)}
-        </div> : <EmptyMessage>No active exceptions{scopedToRun ? ' for this run' : ''}.</EmptyMessage>}
+            {groupCounts.length ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {groupCounts.map((group) => <div key={group.key} className="rounded-xl border border-slate-200 px-4 py-3">
+                <div className="flex items-start justify-between gap-4">
+                  <p className="text-sm font-medium">{group.label}</p>
+                  <div className="flex shrink-0 gap-5 text-right text-xs"><div><p className="font-semibold text-teal-800">{group.active}</p><p className="text-slate-500">enabled</p></div><div><p className="font-semibold text-rose-700">{group.exceptions}</p><p className="text-slate-500">open</p></div></div>
+                </div>
+                <ul className="mt-2 space-y-1">
+                  {group.members.map((rule) => <li key={rule.id} className="flex items-center justify-between gap-2">
+                    <button type="button" onClick={() => onEditRule(rule)} disabled={busyKey === `rule:${rule.id}`} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline disabled:opacity-50">{busyKey === `rule:${rule.id}` ? 'Opening...' : rule.name}</button>
+                    <span className={`shrink-0 text-[11px] ${rule.enabled ? 'text-teal-700' : 'text-slate-400'}`}>{rule.enabled ? 'enabled' : rule.status}</span>
+                  </li>)}
+                </ul>
+              </div>)}
+            </div> : <EmptyMessage>Rule coverage will appear here after you create rules.</EmptyMessage>}
+          </div>
+          <div className="space-y-3 border-t border-slate-100 pt-4">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Priority work</h3>
+              <button type="button" onClick={() => onReviewExceptions(scopedToRun && selectedRun ? { runId: selectedRun.id } : { runId: '' })} className="text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">Review exceptions</button>
+            </div>
+            {scopedExceptions.length ? <div className="grid gap-4 sm:grid-cols-3">
+              {priorityBySeverity.map((bucket) => <div key={bucket.severity} className="rounded-xl border border-slate-200 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <SeverityPill value={bucket.severity} />
+                  <span className="text-sm font-semibold tabular-nums text-slate-700">{bucket.total}</span>
+                </div>
+                {bucket.rules.length ? <ul className="mt-2 space-y-1">
+                  {bucket.rules.map((entry) => <li key={entry.ruleId} className="flex items-center justify-between gap-2">
+                    <button type="button" onClick={() => onReviewExceptions({ severity: bucket.severity, ruleId: entry.ruleId, runId: scopedToRun && selectedRun ? selectedRun.id : '' })} className="truncate text-left text-xs font-semibold text-brand-700 transition hover:text-brand-800 hover:underline">{entry.name}</button>
+                    <span className="shrink-0 text-xs tabular-nums text-slate-500">{entry.count}</span>
+                  </li>)}
+                </ul> : <p className="mt-2 text-xs text-slate-400">Nothing at this level.</p>}
+              </div>)}
+            </div> : <EmptyMessage>No active exceptions{scopedToRun ? ' for this run' : ''}.</EmptyMessage>}
+          </div>
+        </div>
       </section>
       <section className={card}>
         <SectionTitle title="Maintenance" subtitle="Find and purge reconciliation rows whose owning rule no longer exists." action={<div className="flex gap-2"><button type="button" onClick={onFindOrphans} disabled={busyKey === 'orphans'} className={secondaryButton}>{busyKey === 'orphans' ? 'Checking...' : 'Check orphans'}</button><button type="button" onClick={onPurgeOrphans} disabled={busyKey === 'purge-orphans'} className={dangerButton}>Purge orphans</button></div>} />
@@ -1346,7 +1401,7 @@ function ExceptionsPanel({ exceptions, allExceptions, rules, runs, filter, selec
   onBulkComment: () => void;
 }) {
   const outcomes = [...new Set(allExceptions.map((exception) => exception.outcome))];
-  const runIds = [...new Set(allExceptions.map((exception) => exception.lastRunId).filter(Boolean))];
+  const runIds = [...new Set([...runs.map((run) => run.id), ...allExceptions.map((exception) => exception.lastRunId).filter(Boolean)])];
   const toggleSelection = (exceptionId: string, checked: boolean) => onSelectedIds(checked ? [...selectedIds, exceptionId] : selectedIds.filter((id) => id !== exceptionId));
   const visibleIds = exceptions.map((exception) => exception.id);
   // Exceptions are summarised per rule first; the per-key detail is opt-in so a

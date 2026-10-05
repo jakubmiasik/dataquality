@@ -56,9 +56,9 @@ export function AuthPage() {
                   <path d="M4 7h11l-2.5-2.5" /><path d="M20 17H9l2.5 2.5" /><circle cx="18" cy="7" r="2.5" /><circle cx="6" cy="17" r="2.5" />
                 </svg>
               </span>
-              <h1 className="text-2xl font-bold tracking-tight text-slate-900">Fabric Reconciliation</h1>
+              <h1 className="text-2xl font-bold tracking-tight text-slate-900">Reconciliation Engine</h1>
               <p className="mt-2 text-sm text-slate-500">
-                Sign in to compare data across your accessible Fabric sources.
+                Sign in to register rules, run checks and review findings across your Fabric sources.
               </p>
             </div>
 
