@@ -1,3 +1,4 @@
+import { AppSetting } from './AppSetting.js';
 import { ReconciliationException } from './ReconciliationException.js';
 import { ReconciliationExceptionEvent } from './ReconciliationExceptionEvent.js';
 import { ReconciliationFinding } from './ReconciliationFinding.js';
@@ -10,6 +11,7 @@ import { ReconciliationSchedule } from './ReconciliationSchedule.js';
 import { ReconciliationSource } from './ReconciliationSource.js';
 
 export type ReconciliationAppSchema = {
+	AppSetting: AppSetting;
 	ReconciliationSource: ReconciliationSource;
 	ReconciliationRule: ReconciliationRule;
 	ReconciliationRuleField: ReconciliationRuleField;
@@ -25,6 +27,7 @@ export type ReconciliationAppSchema = {
 export type BlankAppSchema = ReconciliationAppSchema;
 
 export const schema = [
+	AppSetting,
 	ReconciliationSource,
 	ReconciliationRule,
 	ReconciliationRuleField,

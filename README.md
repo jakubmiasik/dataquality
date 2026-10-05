@@ -11,10 +11,17 @@ Create an Entra SPA app registration and grant delegated Fabric
 `Workspace.Read.All`, `Lakehouse.Read.All`, and `Warehouse.Read.All`, plus SQL
 `https://database.windows.net//user_impersonation`. Add
 `http://localhost:5175/auth-redirect.html` and the deployed Rayfin app URL
-followed by `/auth-redirect.html` as SPA redirect URIs. Set
-`RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` and
-`RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID` in `rayfin/.env`; Rayfin generates the
-Vite names in `.env.local`. These are public SPA identifiers, not secrets.
+followed by `/auth-redirect.html` as SPA redirect URIs.
+
+Enter the client and tenant IDs in the app's **Configuration** tab. They are
+stored in the Rayfin data service and shared with everyone in the workspace, so
+no rebuild or redeploy is needed to change them. These are public SPA
+identifiers, not secrets.
+
+Setting `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` and
+`RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID` in `rayfin/.env` still works and acts as
+the fallback when the Configuration tab leaves a value empty. Rayfin generates
+the Vite names in `.env.local`.
 
 Fabric REST and SQL endpoint calls use separate delegated tokens for the same
 signed-in user. The gateway binds both tokens to the same Entra identity; SQL
@@ -59,6 +66,7 @@ Open [http://localhost:5173](http://localhost:5173). The Vite proxy forwards
 │       ├── MockAuthService.ts     # Local-dev impl (email/password)
 │       ├── RayfinAuthService.ts   # Production impl (Fabric brokered auth)
 │       ├── rayfinClient.ts        # Typed Rayfin client singleton
+│       ├── appSettings.ts         # Runtime config (Entra IDs, gateway URL)
 │       ├── reconciliationEngine.ts     # Pure comparison engine (shared with the gateway)
 │       ├── reconciliationRepository.ts # Rayfin persistence
 │       ├── reconciliationSchedule.ts   # Cadence maths
@@ -76,6 +84,17 @@ user so history and audit events stay attributable.
 
 Rayfin caps every `@text()` column at 4000 characters, so large payloads
 (row snapshots, summaries, comments) are clamped on write rather than rejected.
+
+## Configuration
+
+The **Configuration** tab holds the Entra client ID, Entra tenant ID, and
+reconciliation gateway URL. They live in the `AppSetting` table, so an operator
+can correct them from the running app and every user picks the change up on
+their next load — no rebuild, redeploy, or restart.
+
+Each value falls back to its build-time `RAYFIN_PUBLIC_*` variable when left
+empty, so deployments that already configure `rayfin/.env` keep working
+unchanged. A value entered in the tab wins over the build-time one.
 
 ## Scheduling
 
@@ -133,7 +152,8 @@ Note the Function App's HTTPS origin from the `azd up` output.
 
 ### 2. Point the app at the gateway
 
-Set `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` to that origin.
+Enter the Function App origin in the app's **Configuration** tab, or set
+`RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` as the fallback.
 
 ### 3. Apply the data schema
 
@@ -141,9 +161,10 @@ Set `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` in `rayfin/.env` to that origin.
 npx rayfin up db apply
 ```
 
-Required after pulling these changes: it creates the `ReconciliationSchedule`
-table and adds the `caseInsensitive` and `trimValues` columns to the rule-field
-tables.
+Required after pulling these changes: it creates the `AppSetting` and
+`ReconciliationSchedule` tables and adds the `caseInsensitive` and `trimValues`
+columns to the rule-field tables. Until `AppSetting` exists the Configuration
+tab still works, but it saves to the current browser only and says so.
 
 ### 4. Deploy the app to Fabric
 
@@ -154,47 +175,23 @@ npm run rayfin:up
 Add the deployed app URL followed by `/auth-redirect.html` to the Entra SPA
 redirect URIs, and the app origin to `allowedRedirectUris` in `rayfin/rayfin.yml`.
 
-### 5. Continuous deployment
+### 5. Continuous integration
 
-`.github/workflows/deploy-fabric.yml` builds, lints and tests on every pull
-request, then deploys to Fabric when a PR merges to `main`. Deploys run in the
-`fabric` GitHub environment, so attach required reviewers there if you want a
-manual approval gate.
-
-The workflow authenticates with `rayfin login --service-principal`, so create an
-Entra app registration, give it access to the target Fabric workspace, and
-configure:
-
-| Kind | Name | Value |
-|------|------|-------|
-| Secret | `RAYFIN_CLIENT_ID` | Service principal application (client) ID |
-| Secret | `RAYFIN_CLIENT_SECRET` | Service principal client secret |
-| Secret | `RAYFIN_TENANT_ID` | Entra tenant ID |
-| Secret | `RAYFIN_DEPLOYMENTS_JSON` | Contents of `rayfin/.deployments.json` after a successful local `rayfin up` |
-| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` | SPA app registration client ID |
-| Variable | `RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID` | SPA app registration tenant ID |
-| Variable | `RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL` | Deployed gateway HTTPS origin |
-
-`RAYFIN_DEPLOYMENTS_JSON` matters: `rayfin/.deployments.json` is gitignored, and
-without it `rayfin up` has no record of the existing AppBackend and provisions a
-new one on every run. Deploy once locally, then copy that file into the secret.
-
-`rayfin up` applies the database schema as part of the deploy. It refuses
-destructive migrations rather than dropping data, so a schema change that would
-lose data fails the job and needs a deliberate local `rayfin up db apply --force`.
-
-The Azure gateway is not deployed by this workflow; run `azd up` from `gateway/`
-when it changes.
+`.github/workflows/ci.yml` builds, lints, and tests on every pull request and on
+pushes to `main`. It does not deploy: run `npm run rayfin:up` when you want to
+publish a new revision to Fabric, and `azd up` from `gateway/` when the gateway
+changes.
 
 ### Troubleshooting
 
-**"Fabric API access is not configured" in the deployed app.** The bundle was
-built without `RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID` / `RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID`.
-These are baked in at build time, so the fix is always to correct the values and
-redeploy — restarting the app changes nothing. Confirm `rayfin/.env` has both
-(locally), or that the matching repository variables are set (in CI), then run
-`npx rayfin up`. To verify a build before deploying, search `dist/assets` for the
-client ID; if it is absent, the deployed app will fail the same way.
+**"… is not set. Open the Configuration tab and enter it."** The Entra client or
+tenant ID has not been provided. Open **Configuration** in the app, enter the
+IDs, and save — the change applies immediately for you and on the next load for
+everyone else in the workspace.
+
+**Configuration says it saved to this browser only.** The `AppSetting` table is
+missing. Run `npx rayfin up db apply` to create it, then save again to share the
+values with the workspace.
 
 ### Hardening before production
 

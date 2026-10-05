@@ -1,5 +1,7 @@
 import { PublicClientApplication } from '@azure/msal-browser';
 
+import { getSettingValue, requireSettingValue } from './appSettings';
+
 const FABRIC_API_ORIGIN = 'https://api.fabric.microsoft.com';
 const FABRIC_SCOPES = [
   'https://api.fabric.microsoft.com/Workspace.Read.All',
@@ -71,19 +73,22 @@ export interface FabricSqlSource {
 }
 
 function getEntraConfig() {
-  const clientId = import.meta.env.VITE_RAYFIN_FABRIC_ENTRA_CLIENT_ID;
-  const tenantId = import.meta.env.VITE_RAYFIN_FABRIC_ENTRA_TENANT_ID;
-  if (!clientId || !tenantId) {
-    throw new Error('Fabric API access is not configured. Set RAYFIN_PUBLIC_FABRIC_ENTRA_CLIENT_ID and RAYFIN_PUBLIC_FABRIC_ENTRA_TENANT_ID in rayfin/.env, then restart Rayfin.');
-  }
-  return { clientId, tenantId };
+  return {
+    clientId: requireSettingValue('fabricEntraClientId'),
+    tenantId: requireSettingValue('fabricEntraTenantId'),
+  };
 }
 
 let client: PublicClientApplication | undefined;
+let clientKey = '';
 
 async function getClient() {
-  if (!client) {
-    const { clientId, tenantId } = getEntraConfig();
+  const { clientId, tenantId } = getEntraConfig();
+  // The MSAL instance is bound to one registration. Rebuild it when an
+  // operator corrects the IDs in the Configuration tab, otherwise the app
+  // would keep using the registration it started with until a full reload.
+  const key = `${clientId}|${tenantId}`;
+  if (!client || clientKey !== key) {
     client = new PublicClientApplication({
       auth: {
         clientId,
@@ -94,6 +99,7 @@ async function getClient() {
       cache: { cacheLocation: 'sessionStorage' },
     });
     await client.initialize();
+    clientKey = key;
   }
   return client;
 }
@@ -212,8 +218,8 @@ export async function listWorkspaceResources(loginHint: string) {
 }
 
 export async function callReconciliationGateway<T>(route: 'catalog' | 'execute', loginHint: string, body: unknown): Promise<T> {
-  const baseUrl = import.meta.env.VITE_RAYFIN_RECONCILIATION_GATEWAY_URL || (import.meta.env.DEV ? '/gateway-api' : '');
-  if (!baseUrl) throw new Error('Set RAYFIN_PUBLIC_RECONCILIATION_GATEWAY_URL in rayfin/.env to the reconciliation Functions origin.');
+  const baseUrl = getSettingValue('reconciliationGatewayUrl') || (import.meta.env.DEV ? '/gateway-api' : '');
+  if (!baseUrl) throw new Error('The reconciliation gateway URL is not set. Open the Configuration tab and enter the Azure Functions origin.');
   const [accessToken, sqlAccessToken] = await Promise.all([
     acquireFabricToken(loginHint),
     acquireToken(loginHint, SQL_SCOPES),

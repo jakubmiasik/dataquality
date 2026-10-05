@@ -39,11 +39,21 @@ import {
   type StoredRule,
   type StoredRun,
 } from '@/services/reconciliationRepository';
+import {
+  emptySettingValues,
+  loadAppSettings,
+  saveAppSettings,
+  settingDefinitions,
+  validateSettings,
+  type AppSettingsState,
+  type SettingKey,
+  type SettingValues,
+} from '@/services/appSettings';
 import type { CompareField, Operand, ReconciliationFinding, ReconciliationResult } from '@/services/reconciliationEngine';
 import { summariseSweep } from '@/services/reconciliationScheduler';
 import { describeSchedule, nextOccurrence, validateSchedule, type ScheduleDefinition } from '@/services/reconciliationSchedule';
 
-type Tab = 'overview' | 'sources' | 'rules' | 'schedules' | 'exceptions' | 'runs' | 'compare';
+type Tab = 'overview' | 'sources' | 'rules' | 'schedules' | 'exceptions' | 'runs' | 'compare' | 'settings';
 type AppData = Awaited<ReturnType<typeof loadReconciliationData>>;
 type ComparisonResult = Awaited<ReturnType<typeof compareStoredRuns>>;
 type OrphanReport = Awaited<ReturnType<typeof findOrphans>>;
@@ -55,7 +65,8 @@ interface CatalogResponse {
   objects: SqlObject[];
 }
 
-const tabs: Array<{ id: Tab; label: string }> = [
+const defaultTabCaption = 'Read-only SQL checks across accessible Fabric sources.';
+const tabs: Array<{ id: Tab; label: string; caption?: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'sources', label: 'Sources' },
   { id: 'rules', label: 'Rules' },
@@ -63,6 +74,7 @@ const tabs: Array<{ id: Tab; label: string }> = [
   { id: 'exceptions', label: 'Exceptions' },
   { id: 'runs', label: 'Runs' },
   { id: 'compare', label: 'Compare runs' },
+  { id: 'settings', label: 'Configuration', caption: 'Connection details for Fabric and the reconciliation gateway.' },
 ];
 
 const ruleGroups = [
@@ -79,7 +91,11 @@ const button = 'inline-flex min-h-9 items-center justify-center gap-2 rounded-lg
 const primaryButton = `${button} border-transparent bg-gradient-to-b from-brand-500 to-brand-600 text-white shadow-sm shadow-brand-600/25 hover:from-brand-600 hover:to-brand-700 hover:shadow-md hover:shadow-brand-600/30 disabled:shadow-none`;
 const secondaryButton = `${button} border-slate-200 bg-white text-slate-700 shadow-sm hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900`;
 const dangerButton = `${button} border-transparent bg-rose-600 text-white shadow-sm shadow-rose-600/20 hover:bg-rose-700`;
-const input = 'min-h-9 w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-brand-400 focus:ring-4 focus:ring-brand-500/15';
+/* Colour is kept out of the base so the invalid variant does not rely on
+   Tailwind source order to beat the default border and ring utilities. */
+const inputBase = 'min-h-9 w-full rounded-lg border bg-white px-3 py-1.5 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:ring-4';
+const input = `${inputBase} border-slate-200 focus:border-brand-400 focus:ring-brand-500/15`;
+const invalidInput = `${inputBase} border-rose-300 focus:border-rose-400 focus:ring-rose-500/15`;
 const labelClass = 'mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500';
 /* Shared surface for every panel section, so elevation and radius stay consistent. */
 const card = 'overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-card card-hover';
@@ -177,6 +193,20 @@ export function ReconciliationPage() {
   const [busyKey, setBusyKey] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [settings, setSettings] = useState<AppSettingsState | null>(null);
+  const [settingsForm, setSettingsForm] = useState<SettingValues>(emptySettingValues);
+  const [settingsErrors, setSettingsErrors] = useState<Partial<Record<SettingKey, string>>>({});
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    loadAppSettings().then((state) => {
+      if (cancelled) return;
+      setSettings(state);
+      setSettingsForm(state.values);
+    }).catch(() => { if (!cancelled) setSettings(null); });
+    return () => { cancelled = true; };
+  }, [userId]);
 
   useEffect(() => {
     if (!userId) return;
@@ -250,6 +280,24 @@ export function ReconciliationPage() {
     try { setData(await loadReconciliationData(user.id)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to refresh reconciliation data.'); }
     finally { setLoading(false); }
+  }
+
+  async function saveSettings() {
+    if (!user) return;
+    const errors = validateSettings(settingsForm);
+    setSettingsErrors(errors);
+    if (Object.keys(errors).length > 0) return;
+    setBusyKey('settings');
+    setError(null);
+    try {
+      const state = await saveAppSettings(settingsForm, user.id, user.name || user.email || user.id);
+      setSettings(state);
+      setSettingsForm(state.values);
+      setNotice(state.source === 'service'
+        ? 'Configuration saved for the workspace.'
+        : 'Configuration saved in this browser.');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to save the configuration.'); }
+    finally { setBusyKey(''); }
   }
 
   async function openSourceRegistration(side: 'A' | 'B' | null = null) {
@@ -683,6 +731,8 @@ export function ReconciliationPage() {
   }
 
   const userName = user?.name || user?.email || 'Signed-in user';
+  /* state.values already folds in the build-time variables, so this reflects what Fabric calls will actually use. */
+  const fabricConfigured = Boolean(settings?.values.fabricEntraClientId && settings?.values.fabricEntraTenantId);
 
   return (
     <div className="app-canvas min-h-screen text-slate-900">
@@ -718,12 +768,18 @@ export function ReconciliationPage() {
 
       <main className="mx-auto max-w-[1440px] px-4 py-7 sm:px-7">
         <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
-          <div><h2 className="text-xl font-bold tracking-tight text-slate-900">{tabs.find((entry) => entry.id === tab)?.label}</h2><p className="mt-1 text-sm text-slate-500">Read-only SQL checks across accessible Fabric sources.</p></div>
+          <div><h2 className="text-xl font-bold tracking-tight text-slate-900">{tabs.find((entry) => entry.id === tab)?.label}</h2><p className="mt-1 text-sm text-slate-500">{tabs.find((entry) => entry.id === tab)?.caption ?? defaultTabCaption}</p></div>
           <button type="button" onClick={() => void refreshData()} disabled={loading} className={secondaryButton}>{loading ? 'Refreshing...' : 'Refresh data'}</button>
         </div>
+        {settings && !fabricConfigured && tab !== 'settings' && (
+          <div role="status" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 shadow-sm">
+            <span className="flex items-start gap-2.5"><span aria-hidden="true" className="mt-0.5 font-bold">!</span><span>Fabric access is not configured yet, so sources and rule runs will fail.</span></span>
+            <button type="button" onClick={() => { setTab('settings'); setError(null); }} className={secondaryButton}>Open Configuration</button>
+          </div>
+        )}
         {error && <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 shadow-sm"><span aria-hidden="true" className="mt-0.5 font-bold">!</span><span>{error}</span></div>}
         {notice && <div role="status" className="mb-4 flex items-start gap-2.5 rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-900 shadow-sm"><span aria-hidden="true" className="mt-0.5 font-bold">✓</span><span>{notice}</span></div>}
-        {!data && <div className={`${card} px-5 py-8 text-sm text-slate-600`}>{loading ? 'Loading reconciliation data...' : 'No reconciliation data is available yet. Configure the Rayfin data service and refresh.'}</div>}
+        {!data && tab !== 'settings' && <div className={`${card} px-5 py-8 text-sm text-slate-600`}>{loading ? 'Loading reconciliation data...' : 'No reconciliation data is available yet. Configure the Rayfin data service and refresh.'}</div>}
 
         {tab === 'overview' && data && <OverviewPanel
           rules={rules} runs={runs} openExceptions={openExceptions} orphanReport={orphanReport} busyKey={busyKey}
@@ -770,6 +826,15 @@ export function ReconciliationPage() {
           rules={rules} runs={selectedComparisonRuns} ruleId={comparisonRuleId} fromRunId={fromRunId} toRunId={toRunId}
           result={comparison} busy={busyKey === 'compare'} onRule={setComparisonRuleId} onFrom={setFromRunId} onTo={setToRunId}
           onCompare={() => void compareSelectedRuns()}
+        />}
+        {tab === 'settings' && <SettingsPanel
+          state={settings} values={settingsForm} errors={settingsErrors} busy={busyKey === 'settings'}
+          onChange={(key, value) => {
+            setSettingsForm((current) => ({ ...current, [key]: value }));
+            setSettingsErrors((current) => ({ ...current, [key]: undefined }));
+          }}
+          onSave={() => void saveSettings()}
+          onReset={() => { if (settings) { setSettingsForm(settings.values); setSettingsErrors({}); } }}
         />}
       </main>
       {registrationOpen && <SourceRegistrationModal
@@ -1253,6 +1318,89 @@ function MetricDeltaCard({ label, value }: { label: string; value: ComparisonRes
 function FindingList({ title, findings, tone }: { title: string; findings: ReconciliationFinding[]; tone: 'red' | 'teal' | 'amber' }) {
   const colors = { red: 'text-rose-800', teal: 'text-teal-800', amber: 'text-amber-800' };
   return <section className={card}><SectionTitle title={title} subtitle={`${findings.length} item${findings.length === 1 ? '' : 's'}`} />{findings.length ? <ul className="divide-y divide-slate-100">{findings.slice(0, 50).map((finding) => <li key={finding.fingerprint} className="px-4 py-3"><p className={`text-sm font-semibold ${colors[tone]}`}>{finding.businessKey}</p><p className="mt-1 text-xs text-slate-600">{humanOutcome(finding.outcome)}{finding.differences.length ? ` · ${finding.differences.map((difference) => difference.field).join(', ')}` : ''}</p></li>)}</ul> : <EmptyMessage>None</EmptyMessage>}</section>;
+}
+
+export function SettingsPanel({
+  state, values, errors, busy, onChange, onSave, onReset,
+}: {
+  state: AppSettingsState | null;
+  values: SettingValues;
+  errors: Partial<Record<SettingKey, string>>;
+  busy: boolean;
+  onChange: (key: SettingKey, value: string) => void;
+  onSave: () => void;
+  onReset: () => void;
+}) {
+  if (!state) return <section className={`${card} px-5 py-8 text-sm text-slate-600`}>Loading configuration...</section>;
+  const dirty = settingDefinitions.some((definition) => values[definition.key].trim() !== state.values[definition.key]);
+  return (
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <section className={card}>
+        <SectionTitle
+          title="Fabric and gateway connection"
+          subtitle="Saved in the workspace, so every user picks these up on their next load."
+        />
+        <form
+          className="space-y-5 px-4 py-5"
+          onSubmit={(event) => { event.preventDefault(); onSave(); }}
+        >
+          {settingDefinitions.map((definition) => {
+            const message = errors[definition.key];
+            const fieldId = `setting-${definition.key}`;
+            return (
+              <div key={definition.key}>
+                <label className={labelClass} htmlFor={fieldId}>{definition.label}</label>
+                <input
+                  id={fieldId}
+                  className={message ? invalidInput : input}
+                  value={values[definition.key]}
+                  placeholder={definition.placeholder}
+                  spellCheck={false}
+                  autoComplete="off"
+                  aria-invalid={message ? true : undefined}
+                  aria-describedby={`${fieldId}-help`}
+                  onChange={(event) => onChange(definition.key, event.target.value)}
+                />
+                <p id={`${fieldId}-help`} className={`mt-1.5 text-xs ${message ? 'text-rose-700' : 'text-slate-500'}`}>
+                  {message ?? definition.description}
+                </p>
+              </div>
+            );
+          })}
+          <div className="flex flex-wrap items-center gap-2 border-t border-slate-200/80 pt-4">
+            <button type="submit" className={primaryButton} disabled={busy}>{busy ? 'Saving...' : 'Save configuration'}</button>
+            <button type="button" className={secondaryButton} onClick={onReset} disabled={busy || !dirty}>Discard changes</button>
+            {dirty && <span className="text-xs text-amber-700">Unsaved changes</span>}
+          </div>
+        </form>
+      </section>
+
+      <section className={card}>
+        <SectionTitle title="How these are used" />
+        <div className="space-y-4 px-4 py-5 text-sm text-slate-600">
+          {state.warning && (
+            <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">{state.warning}</p>
+          )}
+          <p>
+            Saving takes effect immediately for you and on the next load for everyone else. No rebuild or redeploy is
+            needed.
+          </p>
+          <p>
+            Each value falls back to the matching build-time variable when it is left empty, so deployments that already
+            set these in <code className="rounded bg-slate-100 px-1 py-0.5 text-xs">rayfin/.env</code> keep working.
+          </p>
+          <dl className="space-y-2 border-t border-slate-200/80 pt-4 text-xs">
+            {settingDefinitions.map((definition) => (
+              <div key={definition.key}>
+                <dt className="font-semibold text-slate-700">{definition.label}</dt>
+                <dd className="text-slate-500">Falls back to <code className="rounded bg-slate-100 px-1 py-0.5">{definition.envName}</code></dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: string; action?: React.ReactNode }) {
